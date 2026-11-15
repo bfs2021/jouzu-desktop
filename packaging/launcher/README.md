@@ -5,6 +5,17 @@ screen, a console entry point, the Jouzu application payload, and the runtime th
 `apps/launcher/` holds the application; everything in this directory builds, verifies, signs and
 publishes it.
 
+## Jouzu Desktop
+
+Jouzu Desktop ships only the app (shell, host and UI); its installer carries no runtime, and
+the jouzu runtime is installed from npm on first run. Of this directory the desktop build uses
+the NSIS installer (`installer.nsi`, `desktop-installer-hooks.nsh`), the desktop update feed and
+release guard (`desktop-feed.mjs`, `release-guard.mjs`, `verify-updater-signature.mjs`,
+`launcher-notes.mjs`), and the helpers the app installs beside the runtime (`bootstrap.mjs`,
+`control.mjs`, the Git, terminal and command-path scripts). Its release flow is described in
+[RELEASE-CHANNELS.md](RELEASE-CHANNELS.md). The rest of this document describes the full
+launcher packages, which bundle the Jouzu payload and runtime.
+
 ## Packages
 
 | Artifact | Contents | Purpose |

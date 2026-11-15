@@ -1,109 +1,120 @@
-# jouzu-host (phase 1)
+# jouzu-host
 
-A standalone host beside the Tauri app. It serves the built SPA and the first
-`/v1` slice (`health`, `sessions`) with a loopback listener and a per-run token.
-It owns no chat session yet.
+The host sits between the Jouzu Desktop UI and the jouzu runtime. It owns every chat session
+and the runtime process behind it, so a session's life does not depend on any window: closing
+or reloading the UI never stops a reply, and a UI that reconnects catches up from the host.
 
-Run from `apps/launcher` (the built UI is `apps/launcher/dist`):
-
-```powershell
-cargo run --manifest-path host/Cargo.toml -- --dist dist
+```text
+UI  ──HTTP /v1 + SSE──▶  jouzu-host  ──JSON-lines RPC over stdio──▶  jouzu runtime
 ```
 
-The host prints a URL, writes `host.json` under
-`%LOCALAPPDATA%\Shisa.ai\JouzuDesktop`, and logs to `logs/host.log`.
+The desktop shell starts one host per installation and serves the UI from it. The host is a
+separate binary with its own HTTP contract, so another client can drive the same sessions.
+
+## What it does
+
+- **Sessions.** One runtime process per session, held in a Windows Job Object (a no-op
+  elsewhere) so stopping a session or the host ends the whole process tree. Detaching a client
+  never stops a session.
+- **One event stream.** `GET /v1/events` carries every session and control event with a global
+  sequence. A client resumes with `Last-Event-ID`; a gap older than the ring produces a resync
+  instead of a silently incomplete stream. Content is sent only to a client viewing that
+  session; state (status, turns, summary) goes to every client, so a sidebar always knows which
+  sessions are running.
+- **Queue.** A message sent while a reply is running is held in a visible queue and delivered
+  once, at the next step. Stop keeps queued messages so the user can continue or discard them.
+- **Prompts.** Runtime confirmations become approvals (`approval.requested` / `.resolved`);
+  select, input and editor prompts become questions (`question.requested` / `.answered` /
+  `.cancelled`). The runtime's own timeout is used when it gives one, otherwise 120 s.
+- **Recovery.** A runtime that dies is restarted. One that dies three times within five
+  minutes stops the session with an error the user can retry, rather than restarting forever.
+- **Warm runtimes.** A runtime loads its extensions for one folder, so the host keeps one
+  ready for each recently used folder (up to four, plus spares for the most recent), and
+  starts the first one while the window is still loading.
+- **Control.** Jouzu configuration (sign-in, models, tools, language) runs through the host
+  one operation at a time, with progress and device codes reported as events.
+- **Timing.** Every step is logged with its timing to `logs/host.log`, in development and
+  release builds alike.
+
+## Running it
+
+Build the UI first (`npm run build` in `apps/launcher`), then from `apps/launcher`:
 
 ```powershell
-$hostInfo = Get-Content "$env:LOCALAPPDATA\Shisa.ai\JouzuDesktop\host.json" | ConvertFrom-Json
-Invoke-RestMethod "http://127.0.0.1:$($hostInfo.port)/v1/health" -Headers @{ Authorization = "Bearer $($hostInfo.token)" }
+cargo run --manifest-path host/Cargo.toml -- --dist dist --home <host home> `
+  --runtime-home <jouzu data folder>
 ```
 
-Open `http://127.0.0.1:<port>/?token=<token>` once to exchange the token for the
-`HttpOnly` cookie; after that `/v1/...` accepts the cookie.
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `--dist` | Built UI to serve | `./dist` |
+| `--home` | Where `host.json`, `host.lock` and `logs/` go | `JOUZU_HOST_HOME`, then `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop` |
+| `--runtime-home` | `JOUZU_HOME` given to the runtime (sessions, credentials) | `<home>/data` |
+| `--runtime`, `--runtime-arg` | Runtime program and arguments | the runtime provisioned under the data root |
+| `--bash` | Git Bash to give the runtime | discovered |
 
-Tests:
+Use a throwaway `--home` and `--runtime-home` for experiments; never point a development host
+at a real installation's data.
+
+The host listens on loopback only and prints its URL. `host.json` in the home folder names the
+port and a per-run token:
+
+```powershell
+$h = Get-Content <host home>\host.json | ConvertFrom-Json
+Invoke-RestMethod "http://127.0.0.1:$($h.port)/v1/health" -Headers @{ Authorization = "Bearer $($h.token)" }
+```
+
+Opening `http://127.0.0.1:<port>/?token=<token>` in a browser exchanges the token for an
+`HttpOnly` cookie, after which `/v1/...` accepts the cookie.
+
+Only one host runs per home: an exclusive `host.lock` is taken before the listener binds. A
+second start exits with the live process id and port and leaves `host.json` alone; a lock left
+by a dead process is reused. A clean exit removes both files.
+
+A release shell starts only the host built with it (both carry the same build id from
+`scripts/build-app.mjs`), so an installation never pairs a UI with a host from another build.
+
+## API outline
+
+All endpoints are under `/v1` and need the bearer token or the cookie. `GET /v1/capabilities`
+reports the contract version, the runtime kind and the supported features.
+
+```text
+GET  /events                         one SSE stream for all sessions and control
+GET  /sessions                       live sessions
+POST /sessions                       { workspacePath, sessionPath? }  -> 202
+GET  /sessions/persisted             saved sessions per workspace
+GET  /sessions/{id}                  status, pending approvals and questions
+GET  /sessions/{id}/messages         history, paged
+POST /sessions/{id}/messages         { clientMessageId, text }  -> 202 with a receipt
+POST /sessions/{id}/interrupt | /cancel | /stop | /queue
+POST /sessions/{id}/model | /thinking | /compact | /export | /reload
+POST /approvals/{id}/decision        { clientId, decision }
+POST /questions/{id}/answer          { clientId, answers }
+GET  /models, POST /models/refresh
+GET|PUT /tools, GET /mcp, GET|POST /workspaces
+POST /control, POST /control/cancel
+```
+
+A client that answers prompts declares the `prompts` capability when it attaches
+(`?clientId=...&capabilities=view,control,prompts`). A duplicate answer returns
+`409 prompt-resolved`, a late one `409 prompt-expired`.
+
+## Runtime adapter
+
+The host speaks the runtime's RPC mode (`--mode rpc`): JSON lines on stdio, with
+`prompt`, `steer`, `abort`, `get_messages`, `switch_session` and friends, and the runtime's
+`agent_*`, `message_*` and `tool_execution_*` events. All of that wire vocabulary lives in
+`src/runtime/adapter/`; the session core does not depend on it, so another runtime can be
+plugged in by adding an adapter.
+
+## Tests
 
 ```powershell
 cargo test --manifest-path host/Cargo.toml
 ```
 
-Phase 1 intentionally does not include session ownership, SSE, prompts, remote
-pairing, packaging or the Tauri shell switch. The contract is
-`docs/contracts/host-ui-v1.md` in the docs repository.
-
-## Single instance
-
-A per-home exclusive lock (`host.lock`) is acquired before the listener binds.
-A second start exits 1 with the live pid/port and leaves `host.json` untouched;
-a stale lock from a dead process is reused. Clean exit removes both files.
-
-On Windows the lock is an exclusive file handle (no read/write sharing,
-FILE_SHARE_DELETE for self-removal); on non-Windows the lock is not enforced yet.
-
-## Phase 2a: sessions and SSE (pi RPC)
-
-Endpoints (all under `/v1`, bearer/cookie auth):
-
-```text
-POST /sessions                 { workspacePath, sessionPath?, key? } -> 202 + Location
-GET  /sessions                 -> { sessions: [...] }
-GET  /sessions/{id}            -> session info
-POST /sessions/{id}/messages   { clientMessageId, text } -> 202 { messageId, receipt }
-POST /sessions/{id}/interrupt
-POST /sessions/{id}/stop
-GET  /sessions/{id}/events?clientId=...   SSE, Last-Event-ID resume
-```
-
-The host owns one runtime process per session and kills its Windows job tree on
-stop or host exit. Detaching an SSE stream never stops a session.
-
-Runtime selection: the provisioned runtime is used when
-`<home>/runtime/node/node.exe` and `<home>/app/bootstrap.mjs` exist (the default is
-derived from `--runtime-home`). The host speaks pi RPC (`bootstrap.mjs --mode
-rpc`): `get_messages` handshake, `prompt`, `abort`, `switch_session`, and the
-`agent_*`/`message_*`/`tool_execution_*` events.
-
-Real runtime (host metadata in a temp home, runtime data from managed):
-
-```powershell
-cargo run --manifest-path host/Cargo.toml -- --dist dist --home $env:TEMP\jouzu-host `
-  --runtime-home "$env:LOCALAPPDATA\Shisa.ai\JouzuDesktop\data"
-```
-
-`--runtime-home` sets `JOUZU_HOME` (credentials/session state); `--bash` overrides
-Git Bash discovery. Tests use `tests/fixtures/fake-runtime.mjs`, which speaks the
-same pi RPC wire shapes (`{id,type:"response"}` plus `agent_*`/`message_*` events),
-not a private protocol.
-
-Replay is bounded by 5,000 events per session; the 2 MiB byte cap and idle
-reaping are not implemented yet.
-
-## Phase 2b: approvals and questions
-
-Interactive pi `extension_ui_request` methods now become prompts:
-
-```text
-confirm                         -> approval.requested / approval.resolved
-select | input | editor         -> question.requested / question.answered / question.cancelled
-setWidget, setStatus, notify... -> logged and ignored (not prompts)
-```
-
-```text
-POST /v1/approvals/{approvalId}/decision
-{ "clientId": "phone", "decision": "Approve" }
-
-POST /v1/questions/{questionId}/answer
-{ "clientId": "phone", "answers": { "q1": "A" } }
-```
-
-The answering client must have declared the `prompts` capability on its SSE
-attach (`?clientId=...&capabilities=view,control,prompts`). Pending prompts appear
-in `GET /v1/sessions/{id}` and `session.snapshot` as `pendingApprovals` /
-`pendingQuestions`. Answers are written back to pi as
-`{type:"extension_ui_response",id,...,confirmed|value|cancelled}`. Runtime timeout
-is used when present, otherwise 120 s; expiry emits `approval.resolved` with
-state `expired` or `question.cancelled` with reason `expired`. Duplicate answers
-are `409 prompt-resolved`; late answers are `409 prompt-expired`.
-
-The test fixture (`FAKE_RUNTIME_UI=confirm|select|input|editor|noise`) emits the
-real pi wire shapes and waits for the host's response.
+Tests run against `tests/fixtures/fake-runtime.mjs`, which speaks the same RPC wire shapes as
+the real runtime, not a private protocol. `FAKE_RUNTIME_UI=confirm|select|input|editor|noise`
+makes it raise prompts and wait for the host's answer. Acceptance against a real runtime is in
+[`../e2e-runtime/README.md`](../e2e-runtime/README.md).
