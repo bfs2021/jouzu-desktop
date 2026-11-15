@@ -96,6 +96,31 @@ try {
   await mark("savedSessionSwitch", now() - start);
   assertGate("savedSessionSwitch", now() - start, 2_000);
   scenario("P0-3 reopen saved session", true);
+
+  // Image tool settings (#64, #67). Holds whatever the account can do: a
+  // provider is offered only when it lists image models, otherwise the page says
+  // why; the tab renders whether or not tools settings were ever saved.
+  await page.getByRole("button", { name: /^settings$/i }).first().click();
+  const settings = page.getByRole("dialog");
+  await settings.getByRole("tab", { name: /^tools$/i }).click();
+  await settings.getByText("Image generation", { exact: true }).waitFor({ timeout: 10_000 });
+  scenario("Tools tab opens without saved tools settings (#67)", true);
+  const provider = settings.getByLabel("Image provider", { exact: true });
+  await page.waitForFunction(() => !document.querySelector('select[aria-label="Image provider"]')?.textContent?.includes("Loading"), null, { timeout: 25_000 });
+  const offered = await provider.isEnabled();
+  const modelText = await settings.getByLabel("Image model", { exact: true }).inputValue();
+  const reasons = settings.getByRole("list", { name: "Unavailable image providers" });
+  const failedChange = await settings.getByText("This tools change did not complete.").count();
+  const usableProviderOk = offered
+    ? modelText !== ""
+    : (await provider.inputValue()) === "" && await reasons.isVisible();
+  scenario(
+    "Image provider offered only when usable, otherwise reason shown (#64)",
+    usableProviderOk && failedChange === 0,
+    offered ? `provider ${await provider.inputValue()}, model ${modelText}` : await reasons.innerText().catch(() => "no reason shown"),
+  );
+  await page.screenshot({ path: process.env.TEMP + "\\playbook-03-tools.png" });
+  await page.keyboard.press("Escape");
 } catch (error) {
   result.errors.push(String(error?.stack ?? error));
   await page.screenshot({ path: process.env.TEMP + "\\playbook-failure.png" }).catch(() => {});
