@@ -20,6 +20,7 @@ interface ToolsSettings {
 
 interface ImageModel {
   id: string;
+  /** Empty when the model takes no size setting (the runtime's image models). */
   sizes: string[];
 }
 
@@ -84,7 +85,7 @@ export function ToolsPanel() {
       const value = base ?? tools;
       if (!value || !list.length) return;
       const selected = list.find(entry => entry.id === currentModel) ?? list[0];
-      const nextSize = selected.sizes.includes(currentSize) ? currentSize : selected.sizes[0];
+      const nextSize = !selected.sizes.length || selected.sizes.includes(currentSize) ? currentSize : selected.sizes[0];
       if (selected.id !== currentModel || nextSize !== currentSize) {
         const saved = await api.tools.save({ ...value.image, provider, model: selected.id, size: nextSize }) as unknown as ToolsSettings;
         setTools(saved);
@@ -172,11 +173,11 @@ export function ToolsPanel() {
             {!noProvider && models.map(model => <option key={model.id} value={model.id}>{model.id}</option>)}
           </select>
         </label>
-        <label className="text-sm"><span className="text-muted-foreground">Image size</span>
+        {sizes.length > 0 && <label className="text-sm"><span className="text-muted-foreground">Image size</span>
           <select aria-label="Image size" className={select} value={image.size} disabled={busy || noProvider} onChange={event => void save({ size: event.target.value })}>
             {sizes.map(size => <option key={size} value={size}>{size}</option>)}
           </select>
-        </label>
+        </label>}
         <label className="text-sm"><span className="text-muted-foreground">Images per call</span>
           <select aria-label="Images per call" className={select} value={image.maxImages} disabled={busy} onChange={event => void save({ maxImages: Number(event.target.value) })}>
             {MAX_IMAGES.map(max => <option key={max} value={max}>{max}</option>)}

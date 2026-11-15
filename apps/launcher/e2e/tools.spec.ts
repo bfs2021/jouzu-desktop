@@ -10,6 +10,12 @@ const usableShisa: Provider = {
   id: "shisa", label: "Shisa.AI", available: true,
   models: [{ id: "gemini-3-pro-image", sizes: ["1K", "2K", "4K"] }, { id: "gemini-3.1-flash-image", sizes: ["1K", "2K", "4K"] }],
 };
+// A provider from the runtime's model catalog (#65): its image API takes no size.
+const usableOpenRouter: Provider = {
+  id: "openrouter", label: "OpenRouter", available: true,
+  models: [{ id: "black-forest-labs/flux.2-pro", sizes: [] }, { id: "google/gemini-2.5-flash-image", sizes: [] }],
+};
+const noCredentialOpenRouter: Provider = { id: "openrouter", label: "OpenRouter", available: false, reason: "No credential for OpenRouter. Add one under Model providers to generate images with it." };
 const signedOutShisa: Provider = { id: "shisa", label: "Shisa.AI", available: false, reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." };
 
 /** Opens Settings → Tools against a host whose image tool reports `providers`. Returns what the page saved. */
@@ -92,5 +98,35 @@ test("the Tools tab opens with no saved settings and no usable provider", async 
   await expect(dialog.getByLabel("Image provider", { exact: true })).toHaveValue("");
   await expect(dialog.getByRole("list", { name: "Unavailable image providers" })).toBeVisible();
   expect(saves).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+// #65: the runtime's image providers are offered beside Shisa, and switching keeps settings coherent.
+test("the image provider list includes the runtime's providers and switching keeps settings coherent", async ({ page }) => {
+  const { dialog, saves, errors } = await openTools(page, saved, [usableShisa, usableOpenRouter]);
+  const provider = dialog.getByLabel("Image provider", { exact: true });
+  await expect(provider).toHaveValue("shisa");
+  await expect(dialog.getByLabel("Image size", { exact: true })).toBeVisible();
+  await expect(provider.locator("option")).toHaveText(["Shisa.AI", "OpenRouter"]);
+
+  // Another provider: its first model is chosen and saved, and no size is offered (the runtime takes none).
+  await provider.selectOption("openrouter");
+  await expect.poll(() => saves.at(-1)?.provider ?? null).toBe("openrouter");
+  expect(saves.at(-1)?.model).toBe("black-forest-labs/flux.2-pro");
+  await expect(dialog.getByLabel("Image model", { exact: true })).toHaveValue("black-forest-labs/flux.2-pro");
+  await expect(dialog.getByLabel("Image size", { exact: true })).toHaveCount(0);
+
+  // Back to Shisa: its model list and size control return.
+  await provider.selectOption("shisa");
+  await expect.poll(() => saves.at(-1)?.provider ?? null).toBe("shisa");
+  expect(saves.at(-1)?.model).toBe("gemini-3-pro-image");
+  await expect(dialog.getByLabel("Image size", { exact: true })).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("a runtime provider without a credential is not offered, and says why", async ({ page }) => {
+  const { dialog, errors } = await openTools(page, saved, [usableShisa, noCredentialOpenRouter]);
+  await expect(dialog.getByLabel("Image provider", { exact: true }).locator("option")).toHaveText(["Shisa.AI"]);
+  await expect(dialog.getByRole("list", { name: "Unavailable image providers" })).toHaveText("OpenRouter: No credential for OpenRouter. Add one under Model providers to generate images with it.");
   expect(errors).toEqual([]);
 });

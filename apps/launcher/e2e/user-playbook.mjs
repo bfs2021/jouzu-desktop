@@ -32,6 +32,65 @@ async function waitForConversationText(text, timeout = 30_000) {
   await conversation().getByText(text, { exact: true }).first().waitFor({ timeout });
 }
 
+/**
+ * Image tool with a provider other than Shisa (#65). The provider list comes
+ * from the runtime's model catalog, so a provider with a credential in the test
+ * data directory must be listed, selectable and able to generate; switching
+ * back to Shisa must still work. PLAYBOOK_IMAGE_PROVIDER names the provider as
+ * the Tools page labels it (e.g. "OpenRouter"); without it the scenario is
+ * recorded as skipped, never as passed.
+ */
+async function imageProviderScenario() {
+  const name = "P1-image other provider (#65)";
+  const label = process.env.PLAYBOOK_IMAGE_PROVIDER;
+  if (!label) {
+    result.scenarios.push({ name, ok: true, skipped: true, detail: "PLAYBOOK_IMAGE_PROVIDER not set" });
+    return;
+  }
+  const openTools = async () => {
+    await page.getByRole("button", { name: "Settings", exact: true }).first().click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("tab", { name: /tools|ツール/i }).click();
+    await dialog.getByText("Image generation", { exact: true }).waitFor({ timeout: 10_000 });
+    return dialog;
+  };
+  const closeSettings = () => page.keyboard.press("Escape");
+  let dialog = await openTools();
+  const provider = dialog.getByLabel("Image provider");
+  const model = dialog.getByLabel("Image model");
+  const original = await provider.inputValue();
+  const options = await provider.locator("option").allTextContents();
+  const listed = options.includes(label);
+  if (!listed) {
+    scenario(name, false, `"${label}" not offered with a credential; options: ${options.join(", ")}`);
+    await closeSettings();
+    return;
+  }
+  await provider.selectOption({ label });
+  await page.waitForFunction(element => !element.disabled && element.options.length > 0 && element.value, await model.elementHandle(), { timeout: 20_000 });
+  const chosenModel = await model.inputValue();
+  await closeSettings();
+
+  // Generate one image through the chat, approving the reviewed call.
+  await newSession().click();
+  await composer().waitFor({ timeout: 10_000 });
+  await composer().fill("Use the generate_image tool once to draw a small red circle on white. Do not ask questions.");
+  await send().click();
+  await page.getByRole("button", { name: "Approve", exact: true }).first().click({ timeout: 60_000 });
+  await conversation().getByText(/Generated 1 image/).first().waitFor({ timeout: 180_000 });
+  const generated = await conversation().getByRole("img").count() > 0;
+  await page.screenshot({ path: process.env.TEMP + "\\playbook-image-provider.png" });
+
+  // Back to Shisa, and back to whatever was configured before.
+  dialog = await openTools();
+  await provider.selectOption("shisa");
+  await page.waitForFunction(element => !element.disabled && element.value, await model.elementHandle(), { timeout: 20_000 });
+  const shisaModel = await model.inputValue();
+  if (original !== "shisa") await provider.selectOption(original);
+  await closeSettings();
+  scenario(name, generated && Boolean(shisaModel), `provider ${label}, model ${chosenModel}; Shisa model ${shisaModel || "none"}`);
+}
+
 const settingsDialog = () => page.getByRole("dialog").first();
 async function openSettingsTab(name) {
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
@@ -197,6 +256,7 @@ try {
   await page.screenshot({ path: process.env.TEMP + "\\playbook-03-tools.png" });
   await page.keyboard.press("Escape");
   await shisaKeyWithoutRestart();
+  await imageProviderScenario();
 } catch (error) {
   result.errors.push(String(error?.stack ?? error));
   await page.screenshot({ path: process.env.TEMP + "\\playbook-failure.png" }).catch(() => {});
