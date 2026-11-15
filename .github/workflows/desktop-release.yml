@@ -271,15 +271,10 @@ jobs:
           fi
           gh release upload desktop-update-qa latest.json --repo "$GITHUB_REPOSITORY" --clobber
       - name: Verify the feed and the asset are anonymously readable
+        # The release CDN can answer 404 or the previous feed for a while after the
+        # upload; verify-feed.mjs retries until the published feed is served (#81).
         run: |
-          endpoint="https://github.com/${GITHUB_REPOSITORY}/releases/download/desktop-update-qa/latest.json"
-          for attempt in 1 2 3 4 5; do
-            if curl -fsSL "$endpoint" -o published.json; then break; fi
-            sleep 3
-          done
-          cmp latest.json published.json
-          asset="$(node -p "require('./published.json').platforms['windows-x86_64'].url")"
-          curl -fsSL -o /dev/null "$asset"
+          node packaging/launcher/verify-feed.mjs "https://github.com/${GITHUB_REPOSITORY}/releases/download/desktop-update-qa/latest.json" latest.json 300
 
 
 
