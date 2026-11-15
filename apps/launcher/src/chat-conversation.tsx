@@ -219,7 +219,9 @@ function ChatConversationView({ projection, reasoningLive = false, workspace, bu
       // Stop is the user's own choice, not an error; the status line says "Interrupted".
       if (last.message.errorMessage && last.message.stopReason !== "aborted") rows.push(<details key={`error-${last.index}`} className="text-xs text-destructive"><summary className="cursor-pointer select-none">This reply stopped with an error</summary><pre className="mt-1 select-text whitespace-pre-wrap break-words font-mono text-[10px] text-muted-foreground">{last.message.errorMessage}</pre></details>);
       if (turnEnd && !projection.running && !busy && !last.message.content.some(block => block.type === "toolCall") && last.message.stopReason !== "toolUse") {
-        rows.push(<div key={`footer-${last.index}`}><TurnSummary data={summarizeTurn(projection.messages, projection.tools, last.index, changedFiles)} workspace={workspace} onOpenArtifacts={onOpenArtifacts} /><FinalTurnFooter messages={projection.messages} index={last.index} message={last.message} onFork={onFork} forkDisabled={busy} /></div>);
+        // The workspace diff belongs to the latest turn only (#79); earlier turns list
+        // what their own tool calls show.
+        rows.push(<div key={`footer-${last.index}`}><TurnSummary data={summarizeTurn(projection.messages, projection.tools, last.index, nextMessage ? [] : changedFiles)} workspace={workspace} onOpenArtifacts={onOpenArtifacts} /><FinalTurnFooter messages={projection.messages} index={last.index} message={last.message} onFork={onFork} forkDisabled={busy} /></div>);
       }
     }
   }

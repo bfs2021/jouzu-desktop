@@ -59,3 +59,23 @@ describe("the turn status line", () => {
     expect(turnLabel(turn({ n: 1, state: "writing", tools: [] }, "cancelling"), now)).toBe("Stopping…");
   });
 });
+
+// #79: the workspace diff of the last turn is shown under that turn only.
+describe("files a turn changed", () => {
+  const finished = (): ChatProjection => ({
+    ...emptyProjection(),
+    messages: [
+      { role: "user", content: [{ type: "text", text: "first" }] },
+      { role: "assistant", content: [{ type: "text", text: "one" }], stopReason: "stop" },
+      { role: "user", content: [{ type: "text", text: "second" }] },
+      { role: "assistant", content: [{ type: "text", text: "two" }], stopReason: "stop" },
+    ],
+  } as ChatProjection);
+  it("lists them under the latest turn and not under earlier ones", () => {
+    const html = renderToStaticMarkup(<ChatConversation projection={finished()} workspace="C:/work" changedFiles={["C:/work/notes.db-shm"]} />);
+    expect((html.match(/notes\.db-shm/g) ?? []).length).toBeGreaterThan(0);
+    const latest = html.indexOf(">two<");
+    expect(latest).toBeGreaterThan(-1);
+    expect(html.slice(0, latest)).not.toContain("notes.db-shm");
+  });
+});
