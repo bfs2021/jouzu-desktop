@@ -133,28 +133,35 @@ impl ControlManager {
         install: &Path,
         managed: &Path,
         node: Option<std::path::PathBuf>,
-        host_home: &Path,
         runtime_home: &Path,
         events: Option<Arc<crate::events::EventHub>>,
     ) -> Result<Self, String> {
         let app = app::resolve_app(install, managed)?;
         // The runtime's own Node when the host was given one, else the bundled one.
         let node = node.unwrap_or_else(|| app::node_executable(managed));
-        let environment = crate::environment::read(host_home)?
-            .into_iter()
-            .filter(|entry| entry.enabled)
-            .map(|entry| (entry.name, entry.value))
-            .collect();
         Ok(Self {
             context: adapter::ControlContext {
                 node,
                 root: managed.to_path_buf(),
                 app,
                 home: runtime_home.to_path_buf(),
-                environment,
             },
             inflight: Mutex::new(None),
             bus: Arc::new(EventBus::new(events)),
+        })
+    }
+
+    /// How the adapter is started for one request. The variables saved in
+    /// Settings are read here, from the file Settings writes, for every request:
+    /// a key saved a moment ago must reach the next refresh without a restart.
+    pub fn launch_spec(&self) -> Result<adapter::LaunchSpec, ApiError> {
+        let environment = crate::environment::enabled(&self.context.home).map_err(|message| {
+            ApiError::internal(format!(
+                "Saved environment variables could not be read: {message}. Open Settings > Environment and save them again."
+            ))
+        })?;
+        adapter::spec(&self.context, &environment).map_err(|message| {
+            ApiError::internal(format!("Configuration is unavailable: {message}"))
         })
     }
 
@@ -281,9 +288,7 @@ impl ControlManager {
         cancel: Arc<Notify>,
         _started: Instant,
     ) -> Result<Value, ApiError> {
-        let spec = adapter::spec(&self.context).map_err(|message| {
-            ApiError::internal(format!("Configuration is unavailable: {message}"))
-        })?;
+        let spec = self.launch_spec()?;
         let mut command = tokio::process::Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -519,3 +524,47 @@ impl Drop for Job {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manager whose runtime home is `<root>/data`, as the shell starts the host.
+    fn manager(root: &Path) -> ControlManager {
+        let node = root.join("node.exe");
+        std::fs::write(&node, "").unwrap();
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        ControlManager::new(root, root, Some(node), &data, None).expect("control manager")
+    }
+
+    fn value(spec: &adapter::LaunchSpec, name: &str) -> Option<String> {
+        spec.env.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn an_unreadable_saved_file_fails_the_request_with_a_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let control = manager(root.path());
+        std::fs::write(root.path().join("data").join("launcher-environment.bin"), b"broken").unwrap();
+        let error = control.launch_spec().unwrap_err();
+        assert!(format!("{error:?}").contains("Saved environment variables could not be read"), "{error:?}");
+    }
+
+    /// Issue #63: the configuration service reads the file Settings writes
+    /// (`<runtime home>/launcher-environment.bin`) at each request, so a key saved
+    /// after the host started reaches the next model refresh.
+    #[cfg(windows)]
+    #[test]
+    fn a_key_saved_after_start_reaches_the_next_request() {
+        let root = tempfile::tempdir().unwrap();
+        let control = manager(root.path());
+        assert_eq!(value(&control.launch_spec().unwrap(), "SHISA_API_KEY"), None);
+        let data = root.path().join("data");
+        let entry = |value: &str| crate::environment::Entry { name: "SHISA_API_KEY".into(), value: value.into(), enabled: true };
+        crate::environment::save(&data, &[entry("first")]).unwrap();
+        assert_eq!(value(&control.launch_spec().unwrap(), "SHISA_API_KEY").as_deref(), Some("first"));
+        crate::environment::save(&data, &[entry("second")]).unwrap();
+        assert_eq!(value(&control.launch_spec().unwrap(), "SHISA_API_KEY").as_deref(), Some("second"));
+    }
+}

@@ -31,7 +31,7 @@ fn manager(app: &PathBuf, home: &PathBuf) -> Arc<ControlManager> {
     std::fs::create_dir_all(&runtime_home).unwrap();
     // The bundled Node under the install, unless JOUZU_HOST_TEST_NODE names one.
     let node = std::env::var_os("JOUZU_HOST_TEST_NODE").map(PathBuf::from);
-    Arc::new(ControlManager::new(install, install, node, home, &runtime_home, None).expect("control manager"))
+    Arc::new(ControlManager::new(install, install, node, &runtime_home, None).expect("control manager"))
 }
 
 #[tokio::test]

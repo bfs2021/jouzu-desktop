@@ -107,7 +107,6 @@ async fn main() -> ExitCode {
         &install,
         &managed,
         runtime.as_ref().map(|spec| spec.program.clone()),
-        &home,
         &runtime_home,
         Some(events.clone()),
     ) {
