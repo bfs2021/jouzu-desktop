@@ -17,7 +17,8 @@ for development.
 
 ```text
  UI (React, in the Tauri window or a browser)
-   │  HTTP + one SSE event stream, loopback only, per-run token
+   │  HTTP + one SSE event stream: the window on loopback with a per-run token;
+   │  other browsers only through Web access, paired one by one
    ▼
  host (jouzu-host, Rust)          owns sessions, queues, approvals, restarts
    │  JSON-lines RPC over stdio, one process per session
@@ -68,6 +69,23 @@ badge. A stable release `X.Y.Z` is built again from the QA-tested commit with th
 must pass the full user playbook with a real model, and is signed. Details are in
 [`packaging/launcher/RELEASE-CHANNELS.md`](packaging/launcher/RELEASE-CHANNELS.md).
 
+## Web access
+
+Besides the desktop window, you can use the same UI from a browser. It is off until you turn it
+on in **Settings → Web access**, where you choose:
+
+| Setting | Who can connect |
+| --- | --- |
+| Off (default) | Only the desktop window. |
+| This computer only | A browser on this computer. |
+| This computer and trusted networks | Also devices on the private networks you turn on one by one: your local network or Tailscale. Public addresses are never offered. |
+
+Every browser must be paired with a one-time code (shown as a code, a link and a QR code), and
+each paired device can be removed at any time, which disconnects it at once. Local-network
+traffic is plain HTTP, so anyone on that network can read it; use Tailscale when you need the
+connection encrypted. Paired devices are kept as hashes only, in `web-access.json` in the
+Desktop folder.
+
 ## Where data lives
 
 Desktop keeps two things apart: Jouzu's data, which it does not own, and its own installation.
@@ -75,7 +93,7 @@ Desktop keeps two things apart: Jouzu's data, which it does not own, and its own
 | | Windows | macOS and Linux (development only) |
 | --- | --- | --- |
 | **Jouzu home**: sessions, settings, sign-ins and API keys, tools settings | `JOUZU_HOME` if set, otherwise `%LOCALAPPDATA%\Shisa.ai\Jouzu\data` | `JOUZU_HOME` if set, otherwise `data/` in the Desktop folder |
-| **Desktop folder**: the installed runtime (Node.js and the `jouzu` npm package) and its updates, recent folders, update channel, logs | `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop` | `~/Library/Application Support/Shisa.ai/JouzuDesktop` (macOS), `$XDG_DATA_HOME/Shisa.ai/JouzuDesktop` (Linux, default `~/.local/share/...`) |
+| **Desktop folder**: the installed runtime (Node.js and the `jouzu` npm package) and its updates, recent folders, update channel, web access settings and paired devices, logs | `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop` | `~/Library/Application Support/Shisa.ai/JouzuDesktop` (macOS), `$XDG_DATA_HOME/Shisa.ai/JouzuDesktop` (Linux, default `~/.local/share/...`) |
 
 - The Jouzu home on Windows is the same folder the runtime's own start-up uses, so Desktop and
   `jz` in a terminal share one set of sessions and settings. Desktop runs the runtime with that

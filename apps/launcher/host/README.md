@@ -63,7 +63,7 @@ cargo run --manifest-path host/Cargo.toml -- --dist dist --home <host home> `
 Use a throwaway `--home` and `--runtime-home` for experiments; never point a development host
 at a real installation's data.
 
-The host listens on loopback only and prints its URL. `host.json` in the home folder names the
+The window's listener is loopback only, and the host prints its URL. `host.json` in the home folder names the
 port and a per-run token:
 
 ```powershell
