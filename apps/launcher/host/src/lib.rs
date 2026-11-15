@@ -3774,8 +3774,11 @@ mod session_tests {
         let aimed = pool.wait_settled(Duration::from_secs(10)).await;
         assert_eq!(aimed["state"], "ready", "{aimed}");
         assert_ne!(aimed["pid"], scratch["pid"]);
+        // A folder no session has used yet is spelled plainly (`C:\x`, not the
+        // `\\?\C:\x` that canonicalize gives on Windows).
         let folder = std::fs::canonicalize(workspace.path()).unwrap();
-        assert_eq!(aimed["workspace"], folder.to_string_lossy().as_ref());
+        let plain = folder.to_string_lossy();
+        assert_eq!(aimed["workspace"], plain.trim_start_matches("\\\\?\\"));
         session.send("first", "hello").unwrap();
         assert_eq!(
             session.runtime_pid(),
@@ -3987,8 +3990,14 @@ mod session_tests {
     async fn a_new_session_in_a_folder_keeps_the_spelling_its_sessions_use() {
         let (manager, _home, workspace) = manager(50);
         let folder = std::fs::canonicalize(workspace.path()).unwrap();
-        // An older session spells the folder differently (as \\?\C:\x vs C:\x on Windows).
-        let spelled = format!("{}/", folder.to_string_lossy());
+        // An older session spells the folder differently: on Windows the verbatim
+        // `\\?\C:\x` that canonicalize gives (a verbatim path takes no `/`), elsewhere
+        // with a trailing slash.
+        let spelled = if folder.to_string_lossy().starts_with("\\\\?\\") {
+            folder.to_string_lossy().into_owned()
+        } else {
+            format!("{}/", folder.to_string_lossy())
+        };
         let directory = manager.runtime_home().join("state").join("sessions");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
@@ -5380,7 +5389,7 @@ mod session_tests {
         let canonical = path.canonicalize().unwrap().to_string_lossy().into_owned();
         // The launcher (1.0.x, still on the stable channel) keys entries by
         // `fs::canonicalize`, which on Windows starts with `\\?\`.
-        let legacy = format!("\\\\?\\{canonical}");
+        let legacy = format!("\\\\?\\{}", canonical.trim_start_matches("\\\\?\\"));
         std::fs::write(
             state.join("session-preferences.json"),
             json!({ legacy.clone(): { "pinned": true, "archived": false, "title": "Kept" } }).to_string(),
