@@ -3787,6 +3787,50 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// Issue #87: on a first launch the desktop starts the host, then installs
+    /// the managed runtime. The host must pick the runtime up once it exists,
+    /// for sessions and for the warm pool, without being restarted.
+    #[tokio::test]
+    async fn a_managed_runtime_installed_after_the_host_started_is_picked_up() {
+        let managed = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::managed(
+            managed.path().to_path_buf(),
+            managed.path().to_path_buf(),
+            managed.path().join("data"),
+            None,
+            50,
+            None,
+        ));
+        // The host binary asks for a warm runtime at start, before the install.
+        assert!(manager.enable_warm_runtime().is_none());
+        assert!(manager.node_executable().is_none());
+        let error = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .err()
+            .expect("no runtime yet");
+        assert_eq!(error.code, "runtime-missing", "{}", error.message);
+
+        // What the first-run preparation writes: the bundled Node, then the app.
+        let node = managed.path().join("runtime").join("node").join("node.exe");
+        std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+        std::fs::copy(RuntimeSpec::node_script(&fixture()).program, &node).unwrap();
+        let app = managed.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::copy(fixture(), app.join("bootstrap.mjs")).unwrap();
+
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .expect("the installed runtime is used");
+        assert_eq!(manager.node_executable(), Some(node));
+        let pool = manager.warm_runtime().expect("the warm pool started with the runtime");
+        let status = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(status["state"], "ready", "{status}");
+        session.send("first", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn a_session_takes_a_warm_runtime_that_is_still_starting() {
         let (manager, _home, workspace) =
