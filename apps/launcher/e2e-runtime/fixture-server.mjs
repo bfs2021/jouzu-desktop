@@ -45,7 +45,16 @@ export function startFixtureServer(port = 0) {
         response.end('data: [DONE]\n\n');
         return;
       }
-      chunk({ content: messages.some(message => message.role === 'tool') ? 'tool finished' : `fixture reply: ${text}` });
+      // The user playbook's prompts get the answers a real model gives, so the playbook
+      // can run on a throwaway home: a product for "What is A × B?", and a reply in
+      // Japanese when the runtime instructs Japanese replies.
+      const product = /What is (\d+) × (\d+)\?/.exec(text);
+      const japanese = system.includes('Response language: Japanese (ja)');
+      const answer = messages.some(message => message.role === 'tool') ? 'tool finished'
+        : product ? String(Number(product[1]) * Number(product[2]))
+        : japanese ? 'あかです。'
+        : `fixture reply: ${text}`;
+      chunk({ content: answer });
       chunk({}, 'stop');
       response.end('data: [DONE]\n\n');
     });

@@ -46,6 +46,7 @@ const ACTIONS: &[&str] = &[
     "shisa-login",
     "shisa-logout",
     "provider-oauth",
+    "language",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -536,6 +537,27 @@ mod tests {
         let data = root.join("data");
         std::fs::create_dir_all(&data).unwrap();
         ControlManager::new(root, root, Some(node), &data, None).expect("control manager")
+    }
+
+    /// Issue #72: every operation the configuration service implements must be
+    /// one the host lets through, or the UI's request is refused before it runs.
+    #[test]
+    fn every_operation_the_service_handles_is_allowed() {
+        let mut handled = Vec::new();
+        for quote in ['\'', '"'] {
+            let marker = format!("action === {quote}");
+            let mut rest = adapter::SCRIPT;
+            while let Some(index) = rest.find(&marker) {
+                rest = &rest[index + marker.len()..];
+                if let Some(end) = rest.find(quote) {
+                    handled.push(rest[..end].to_string());
+                }
+            }
+        }
+        assert!(handled.iter().any(|action| action == "language"), "{handled:?}");
+        for action in &handled {
+            assert!(ACTIONS.contains(&action.as_str()), "the host refuses `{action}`, which control.mjs handles");
+        }
     }
 
     fn value(spec: &adapter::LaunchSpec, name: &str) -> Option<String> {
