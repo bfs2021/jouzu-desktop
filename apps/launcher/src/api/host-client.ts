@@ -339,7 +339,7 @@ export class HostClient {
     return this.request("/v1/tools", { method: "PUT", body: JSON.stringify({ image }) });
   }
 
-  toolProviders(): Promise<{ providers: Array<{ id: string; label: string }> }> {
+  toolProviders(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean }> }> {
     return this.request("/v1/tools/providers");
   }
 

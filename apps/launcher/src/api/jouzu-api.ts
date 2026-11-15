@@ -250,7 +250,7 @@ export interface ModelApi {
 export interface ToolsApi {
   settings(): Promise<{ path: string; exists: boolean; settings: Record<string, unknown> }>;
   save(image: Record<string, unknown>): Promise<Record<string, unknown>>;
-  providers(): Promise<{ providers: Array<{ id: string; label: string }> }>;
+  providers(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean }> }>;
   models(provider: string): Promise<{ models: unknown }>;
 }
 

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension, { setCredentialReader } from "../../../packaging/launcher/extensions/jouzu-image/index.js";
+import extension, { listModels, listProviders, setCredentialReader, setRegistryLoader } from "../../../packaging/launcher/extensions/jouzu-image/index.js";
 
 function load() {
   const tools = [];
@@ -39,11 +39,26 @@ const bytes = png(2816, 1536);
 const imageBody = () => ({ steps: [{ type: "model_output", content: [{ type: "image", mime_type: "image/png", data: bytes.toString("base64") }] }] });
 const ok = body => ({ ok: true, status: 200, json: async () => body });
 
+// The runtime's model registry, reduced to what the extension uses.
+const flux = { type: "image", id: "black-forest-labs/flux.2-pro", provider: "openrouter", api: "openrouter-images" };
+const gemini = { type: "image", id: "google/gemini-2.5-flash-image", provider: "openrouter", api: "openrouter-images" };
+function registry({ models = [], available = models, generateImages } = {}) {
+  return {
+    getModelsOfType: (_type, provider) => models.filter(model => !provider || model.provider === provider),
+    getAvailableOfType: async (_type, provider) => available.filter(model => !provider || model.provider === provider),
+    getProviderDisplayName: id => (id === "openrouter" ? "OpenRouter" : id),
+    generateImages: generateImages ?? vi.fn(),
+  };
+}
+const runtimeImage = () => ({ stopReason: "stop", output: [{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" }] });
+
 describe("generate_image extension", () => {
   let home = null;
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn());
     setCredentialReader(async () => ({ type: "oauth", access: "test-token" }));
+    // By default the runtime lists no image models, so only the own Shisa adapter applies.
+    setRegistryLoader(async () => registry());
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -171,5 +186,87 @@ describe("generate_image extension", () => {
     const result = await tool.execute("call", { prompt: "a cat", size: "4K" });
     expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1].body).response_format.image_size).toBe("1K");
     expect(result.details.size).toBe("1K");
+  });
+
+  it("lists the runtime's image providers beside Shisa, with whether each has a credential", async () => {
+    const providers = await listProviders(registry({ models: [flux, gemini], available: [] }));
+    expect(providers).toEqual([
+      { id: "shisa", label: "Shisa.AI", available: true },
+      { id: "openrouter", label: "OpenRouter", available: false },
+    ]);
+    const models = await listModels(registry({ models: [flux, gemini] }), "openrouter");
+    // The runtime's image API takes no size, so its models offer none.
+    expect(models).toEqual([{ id: flux.id, sizes: [] }, { id: gemini.id, sizes: [] }]);
+  });
+
+  it("marks Shisa unavailable without a credential instead of hiding it", async () => {
+    setCredentialReader(async () => undefined);
+    const providers = await listProviders(registry());
+    expect(providers).toEqual([{ id: "shisa", label: "Shisa.AI", available: false }]);
+  });
+
+  it("generates with a runtime provider through the runtime's registry, never its own request", async () => {
+    home = homeWith({ image: { provider: "openrouter", model: gemini.id, size: "2K", maxImages: 2 } });
+    process.env.JOUZU_HOME = home;
+    const generateImages = vi.fn().mockResolvedValue(runtimeImage());
+    const modelRegistry = registry({ models: [flux, gemini], generateImages });
+    const { tool } = load();
+    const result = await tool.execute("call", { prompt: "a cat", count: 2 }, undefined, undefined, { modelRegistry });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(generateImages).toHaveBeenCalledTimes(2);
+    expect(generateImages.mock.calls[0][0]).toBe(gemini);
+    expect(generateImages.mock.calls[0][1]).toEqual({ input: [{ type: "text", text: "a cat" }] });
+    expect(result.details).toMatchObject({ provider: "openrouter", model: gemini.id, size: null });
+    expect(result.details.images).toHaveLength(2);
+    expect(result.content[0].text).not.toContain("Size:");
+    const sidecar = JSON.parse(readFileSync(join(home, "artifacts", "images", `${result.details.images[0].id}.json`), "utf8"));
+    expect(sidecar.source).toMatchObject({ provider: "openrouter", model: gemini.id });
+  });
+
+  it("starts from the requested provider's first model, not the configured provider's model", async () => {
+    home = homeWith({ image: { provider: "shisa", model: "gemini-3-pro-image", size: "1K" } });
+    process.env.JOUZU_HOME = home;
+    const generateImages = vi.fn().mockResolvedValue(runtimeImage());
+    const { tool } = load();
+    const result = await tool.execute("call", { prompt: "a cat", provider: "openrouter" }, undefined, undefined, { modelRegistry: registry({ models: [flux, gemini], generateImages }) });
+    expect(generateImages.mock.calls[0][0]).toBe(flux);
+    expect(result.details.model).toBe(flux.id);
+  });
+
+  it("names the missing credential of a runtime provider instead of failing silently", async () => {
+    home = homeWith({ image: { provider: "openrouter", model: flux.id } });
+    process.env.JOUZU_HOME = home;
+    const generateImages = vi.fn();
+    const { tool } = load();
+    await expect(tool.execute("call", { prompt: "a cat" }, undefined, undefined, { modelRegistry: registry({ models: [flux], available: [], generateImages }) }))
+      .rejects.toThrow("No credential for OpenRouter");
+    expect(generateImages).not.toHaveBeenCalled();
+  });
+
+  it("reports the runtime's own error for a failed generation", async () => {
+    home = homeWith({ image: { provider: "openrouter", model: flux.id } });
+    process.env.JOUZU_HOME = home;
+    const generateImages = vi.fn().mockResolvedValue({ stopReason: "error", output: [], errorMessage: "402 Insufficient credits" });
+    const { tool } = load();
+    await expect(tool.execute("call", { prompt: "a cat" }, undefined, undefined, { modelRegistry: registry({ models: [flux], generateImages }) }))
+      .rejects.toThrow("402 Insufficient credits");
+  });
+
+  it("does not name a size in the review of a runtime provider's call", async () => {
+    home = homeWith({ image: { provider: "openrouter", model: flux.id, size: "2K" } });
+    process.env.JOUZU_HOME = home;
+    const { handlers } = load();
+    const select = vi.fn().mockResolvedValue("Deny");
+    await handlers.get("tool_call")[0]({ toolName: "generate_image", input: { prompt: "a cat" } }, { ui: { select }, modelRegistry: registry({ models: [flux] }) });
+    const body = JSON.parse(select.mock.calls[0][0].split("\n")[1]);
+    expect(body).toMatchObject({ provider: "openrouter", model: flux.id });
+    expect(body).not.toHaveProperty("size");
+  });
+
+  it("refuses a provider neither the runtime nor the desktop knows", async () => {
+    home = homeWith({ image: { provider: "nobody" } });
+    process.env.JOUZU_HOME = home;
+    const { tool } = load();
+    await expect(tool.execute("call", { prompt: "a cat" }, undefined, undefined, { modelRegistry: registry({ models: [flux] }) })).rejects.toThrow("Unknown image provider: nobody");
   });
 });

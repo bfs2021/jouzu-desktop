@@ -20,7 +20,15 @@ interface ToolsSettings {
 
 interface ImageModel {
   id: string;
+  /** Empty when the model takes no size setting (the runtime's image models). */
   sizes: string[];
+}
+
+interface ImageProvider {
+  id: string;
+  label: string;
+  /** False when the runtime has no credential for it yet. */
+  available?: boolean;
 }
 
 const SIZES = ["1K", "2K", "4K"];
@@ -46,7 +54,7 @@ function readModels(value: unknown): ImageModel[] {
 export function ToolsPanel() {
   const api = useApi();
   const [tools, setTools] = useState<ToolsSettings | null>(null);
-  const [providers, setProviders] = useState<{ id: string; label: string }[]>([]);
+  const [providers, setProviders] = useState<ImageProvider[]>([]);
   const [models, setModels] = useState<ImageModel[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -61,7 +69,7 @@ export function ToolsPanel() {
       const value = base ?? tools;
       if (!value || !list.length) return;
       const selected = list.find(entry => entry.id === currentModel) ?? list[0];
-      const nextSize = selected.sizes.includes(currentSize) ? currentSize : selected.sizes[0];
+      const nextSize = !selected.sizes.length || selected.sizes.includes(currentSize) ? currentSize : selected.sizes[0];
       if (selected.id !== currentModel || nextSize !== currentSize) {
         const saved = await api.tools.save({ ...value.image, provider, model: selected.id, size: nextSize }) as unknown as ToolsSettings;
         setTools(saved);
@@ -109,6 +117,7 @@ export function ToolsPanel() {
   if (!tools) return <p className="text-sm text-muted-foreground">{error ?? "Loading tools…"}</p>;
   const image = tools.image;
   const sizes = models.find(model => model.id === image.model)?.sizes ?? SIZES;
+  const current = providers.find(provider => provider.id === image.provider);
 
   return <Card className="border-border shadow-none">
     <CardHeader>
@@ -124,7 +133,7 @@ export function ToolsPanel() {
         <label className="text-sm"><span className="text-muted-foreground">Image provider</span>
           <select aria-label="Image provider" className={select} value={image.provider} disabled={busy || !providers.length} onChange={event => { const provider = event.target.value; void refreshModels(provider, "", ""); }}>
             {!providers.length && <option value={image.provider}>{image.provider}</option>}
-            {providers.map(provider => <option key={provider.id} value={provider.id}>{provider.label}</option>)}
+            {providers.map(provider => <option key={provider.id} value={provider.id}>{provider.available === false ? `${provider.label} (no credential)` : provider.label}</option>)}
           </select>
         </label>
         <label className="text-sm"><span className="text-muted-foreground">Image model</span>
@@ -137,17 +146,18 @@ export function ToolsPanel() {
             {models.map(model => <option key={model.id} value={model.id}>{model.id}</option>)}
           </select>
         </label>
-        <label className="text-sm"><span className="text-muted-foreground">Image size</span>
+        {sizes.length > 0 && <label className="text-sm"><span className="text-muted-foreground">Image size</span>
           <select aria-label="Image size" className={select} value={image.size} disabled={busy} onChange={event => void save({ size: event.target.value })}>
             {sizes.map(size => <option key={size} value={size}>{size}</option>)}
           </select>
-        </label>
+        </label>}
         <label className="text-sm"><span className="text-muted-foreground">Images per call</span>
           <select aria-label="Images per call" className={select} value={image.maxImages} disabled={busy} onChange={event => void save({ maxImages: Number(event.target.value) })}>
             {MAX_IMAGES.map(max => <option key={max} value={max}>{max}</option>)}
           </select>
         </label>
       </div>
+      {current?.available === false && <p className="text-xs text-muted-foreground">No credential for {current.label}. Add one under Model providers to generate images with it.</p>}
       {error && <ErrorLine raw={error} failed="This tools change did not complete." onDismiss={() => setError(null)} />}
       <div className="border-t border-border pt-3 text-xs text-muted-foreground">
         Reviewed calls: {tools.reviewTools.join(", ")}

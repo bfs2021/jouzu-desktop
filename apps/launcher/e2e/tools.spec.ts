@@ -1,72 +1,73 @@
 import { test, expect, type Page } from "@playwright/test";
-import { readFile } from "node:fs/promises";
-import { resolve, extname, sep } from "node:path";
+import { UI_BASE, emptyControlState, stubHostControl } from "./host-control";
 
-test.use({ channel: process.env.JOUZU_UI_TEST_BROWSER });
+// The Tools tab against a stateful /v1/tools backend. The provider list mirrors
+// what the image extension reports: its own Shisa adapter plus every provider
+// the runtime's model catalog lists image models for (#65).
+type Image = { enabled: boolean; provider: string; model: string; size: string; maxImages: number };
 
-// Drives the Tools tab against a stateful settings backend.
-async function openTools(page: Page) {
-  await page.addInitScript(() => {
-    localStorage.setItem("jouzu.ui.language", "en");
-    (window as any).isTauri = true;
-    // The test origin is not a secure context; the app expects crypto.randomUUID.
-    if (!crypto.randomUUID) Object.defineProperty(crypto, "randomUUID", { value: () => `test-${Math.random().toString(16).slice(2)}` });
-    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
-    let settings = {
-      image: { enabled: true, provider: "shisa", model: "gemini-3-pro-image", size: "1K", maxImages: 3 },
-      reviewTools: ["generate_image"],
-    };
-    (window as any).__SAVED__ = [];
-    (window as any).__TAURI_INTERNALS__ = {
-      metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
-      transformCallback: () => 1,
-      unregisterCallback: () => {},
-      invoke: async (command: string, args: any) => {
-        if (command === "launcher_state") return { ready: true, bash: true, platform: "windows", recent: [] };
-        if (command === "component_versions") return { jouzu: "0.1.18", development: true };
-        if (command === "environment_read") return [];
-        if (command === "control_request") {
-          return { schemaVersion: 1, modelReady: true, profile: "core", account: { signedIn: true }, credentials: [], customProviders: [], providers: [{ id: "openai", name: "OpenAI" }], models: [] };
-        }
-        if (command === "tools_settings_read") return settings;
-        if (command === "tools_settings_save") {
-          settings = { ...settings, image: args.image };
-          (window as any).__SAVED__.push(args.image);
-          return settings;
-        }
-        if (command === "image_providers") return { providers: [{ id: "shisa", label: "Shisa.AI" }] };
-        if (command === "image_models") return { models: ["gemini-3-pro-image", "gemini-3.1-flash-image"] };
-        if (command.includes("version")) return "0.1.0";
-        return 1;
-      },
-    };
+async function openTools(page: Page, options: { openRouterAvailable: boolean }) {
+  const saved: Image[] = [];
+  let image: Image = { enabled: true, provider: "shisa", model: "gemini-3-pro-image", size: "1K", maxImages: 3 };
+  await stubHostControl(page, () => ({ ...emptyControlState, account: { signedIn: true } }));
+  const json = (body: unknown) => ({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  // Registered after stubHost, so these answer first.
+  await page.route("**/v1/tools**", async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname === "/v1/tools" && request.method() === "GET") return route.fulfill(json({ path: "tools.json", exists: true, settings: { image, reviewTools: ["generate_image"] } }));
+    if (url.pathname === "/v1/tools" && request.method() === "PUT") {
+      image = { ...image, ...request.postDataJSON().image };
+      saved.push(image);
+      return route.fulfill(json({ image, reviewTools: ["generate_image"] }));
+    }
+    if (url.pathname === "/v1/tools/providers") {
+      return route.fulfill(json({ providers: [
+        { id: "shisa", label: "Shisa.AI", available: true },
+        { id: "openrouter", label: "OpenRouter", available: options.openRouterAvailable },
+      ] }));
+    }
+    if (url.pathname === "/v1/tools/models") {
+      const provider = url.searchParams.get("provider");
+      if (provider === "openrouter") return route.fulfill(json({ models: [{ id: "black-forest-labs/flux.2-pro", sizes: [] }, { id: "google/gemini-2.5-flash-image", sizes: [] }] }));
+      return route.fulfill(json({ models: [{ id: "gemini-3-pro-image", sizes: ["1K", "2K", "4K"] }, { id: "gemini-3.1-flash-lite-image", sizes: ["1K"] }] }));
+    }
+    return route.fulfill({ status: 404, body: "" });
   });
-  const dist = resolve("dist");
-  await page.route("http://jouzu-ui.test/**", async route => {
-    const pathname = decodeURIComponent(new URL(route.request().url()).pathname);
-    const file = resolve(dist, pathname === "/" ? "index.html" : `.${pathname}`);
-    if (!file.startsWith(dist + sep)) return route.abort();
-    const contentType = ({ ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml" } as Record<string, string>)[extname(file)] ?? "application/octet-stream";
-    try { await route.fulfill({ body: await readFile(file), contentType }); } catch { await route.fulfill({ status: 404, body: "Not found" }); }
-  });
-  await page.goto("http://jouzu-ui.test/");
-}
-
-test("the Tools tab edits the image tool settings", async ({ page }) => {
-  await openTools(page);
-  const settings = page.getByRole("button", { name: "Settings", exact: true }).first();
-  await settings.waitFor({ state: "visible", timeout: 30000 });
-  await settings.click();
+  await page.addInitScript(() => localStorage.setItem("jouzu.ui.language", "en"));
+  await page.goto(UI_BASE);
+  await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   const dialog = page.getByRole("dialog");
-  await expect(dialog.getByRole("tab", { name: "Tools" })).toBeVisible();
   await dialog.getByRole("tab", { name: "Tools" }).click();
   await expect(dialog.getByText("Image generation", { exact: true })).toBeVisible();
-  await expect(dialog.getByLabel("Image provider")).toHaveValue("shisa");
-  await expect(dialog.getByLabel("Image model")).toHaveValue("gemini-3-pro-image");
-  await expect(dialog.getByLabel("Images per call")).toHaveValue("3");
-  await expect(dialog.getByText("Reviewed calls: generate_image")).toBeVisible();
+  return { dialog, saved };
+}
 
-  await dialog.getByLabel("Image model").selectOption("gemini-3.1-flash-image");
-  await expect.poll(async () => await page.evaluate(() => (window as any).__SAVED__.at(-1)?.model ?? null)).toBe("gemini-3.1-flash-image");
-  await expect(dialog.getByLabel("Image model")).toHaveValue("gemini-3.1-flash-image");
+test("the image provider list includes the runtime's providers and switching keeps settings coherent", async ({ page }) => {
+  const { dialog, saved } = await openTools(page, { openRouterAvailable: true });
+  const provider = dialog.getByLabel("Image provider");
+  await expect(provider).toHaveValue("shisa");
+  await expect(dialog.getByLabel("Image size")).toBeVisible();
+  await expect(provider.locator("option")).toHaveText(["Shisa.AI", "OpenRouter"]);
+
+  // Another provider: its first model is chosen and saved, and no size is offered (the runtime takes none).
+  await provider.selectOption("openrouter");
+  await expect.poll(() => saved.at(-1)?.provider ?? null).toBe("openrouter");
+  expect(saved.at(-1)?.model).toBe("black-forest-labs/flux.2-pro");
+  await expect(dialog.getByLabel("Image model")).toHaveValue("black-forest-labs/flux.2-pro");
+  await expect(dialog.getByLabel("Image size")).toHaveCount(0);
+
+  // Back to Shisa: its model list and size control return.
+  await provider.selectOption("shisa");
+  await expect.poll(() => saved.at(-1)?.provider ?? null).toBe("shisa");
+  expect(saved.at(-1)?.model).toBe("gemini-3-pro-image");
+  await expect(dialog.getByLabel("Image size")).toBeVisible();
+});
+
+test("a provider without a credential is listed and says so instead of failing silently", async ({ page }) => {
+  const { dialog } = await openTools(page, { openRouterAvailable: false });
+  const provider = dialog.getByLabel("Image provider");
+  await expect(provider.locator("option")).toHaveText(["Shisa.AI", "OpenRouter (no credential)"]);
+  await provider.selectOption("openrouter");
+  await expect(dialog.getByText("No credential for OpenRouter. Add one under Model providers to generate images with it.")).toBeVisible();
 });
