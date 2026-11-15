@@ -1,9 +1,13 @@
 # Jouzu Desktop
 
-Jouzu Desktop is the desktop app for [Jouzu](https://www.npmjs.com/package/jouzu), an AI work
-agent. It gives Jouzu a chat workspace: folders as workspaces, sessions that keep running when
-the window closes, approvals and questions answered in place, files a turn changed, model and
-tool settings, and in-app updates.
+Jouzu Desktop is a desktop front end for [Jouzu](https://www.npmjs.com/package/jouzu), an AI
+work agent. It gives Jouzu a chat workspace: folders as workspaces, sessions that keep running
+when the window closes, approvals and questions answered in place, files a turn changed, model
+and tool settings, and in-app updates.
+
+The agent itself is the jouzu runtime, installed from npm. Sessions, settings and sign-ins
+belong to Jouzu and stay in Jouzu's own home folder, the same one the `jz` command uses, so
+Desktop and the terminal see the same sessions. Desktop never copies or migrates that data.
 
 The interface is available in English, Japanese, and Simplified and Traditional Chinese.
 Windows 10 and 11 (x64) are the released platforms; the same sources build on macOS and Linux
@@ -32,8 +36,8 @@ for development.
   See [`apps/launcher/host/README.md`](apps/launcher/host/README.md).
 - **Jouzu runtime.** The agent itself, installed on first run from the official `jouzu` npm
   package together with a pinned Node.js. The desktop installer carries the app only; the
-  runtime updates separately. The host talks to it through an adapter, so the runtime is
-  replaceable.
+  runtime updates separately. It runs with Jouzu's own home (see below), not a Desktop
+  folder. The host talks to it through an adapter, so the runtime is replaceable.
 - **Shell.** The Tauri app (`apps/launcher/src-tauri`) starts the host, opens the window,
   provisions the runtime and applies app updates. A release shell runs only the host built
   with it, so an install never mixes builds.
@@ -54,6 +58,11 @@ The channel is only which feed the app updates from: it uses the same install fo
 same data and the same sign-ins, so switching does not reset anything. Switching back to
 stable offers the current stable build, and nothing installs until you confirm.
 
+What you install decides what you have: a QA package is a QA build whichever channel is
+selected, and the channel setting never changes the app's icon or behaviour. No stable
+release has been published under this process yet; the builds published so far are QA
+builds.
+
 QA packages are release candidates (`X.Y.Z-rc.N`) and carry the Jouzu icon with a **QA**
 badge. A stable release `X.Y.Z` is built again from the QA-tested commit with the normal icon,
 must pass the full user playbook with a real model, and is signed. Details are in
@@ -61,15 +70,21 @@ must pass the full user playbook with a real model, and is signed. Details are i
 
 ## Where data lives
 
-| Platform | Folder |
-| --- | --- |
-| Windows | `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop` |
-| macOS | `~/Library/Application Support/Shisa.ai/JouzuDesktop` |
-| Linux | `$XDG_DATA_HOME/Shisa.ai/JouzuDesktop` (default `~/.local/share/...`) |
+Desktop keeps two things apart: Jouzu's data, which it does not own, and its own installation.
 
-`data/` holds sessions, settings and credentials, the runtime sits beside it, and `logs/`
-holds the app and host logs (`host.log` records timing for every session step) and any crash
-records. **Settings → System → Open the log folder** opens it.
+| | Windows | macOS and Linux (development only) |
+| --- | --- | --- |
+| **Jouzu home**: sessions, settings, sign-ins and API keys, tools settings | `JOUZU_HOME` if set, otherwise `%LOCALAPPDATA%\Shisa.ai\Jouzu\data` | `JOUZU_HOME` if set, otherwise `data/` in the Desktop folder |
+| **Desktop folder**: the installed runtime (Node.js and the `jouzu` npm package) and its updates, recent folders, update channel, logs | `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop` | `~/Library/Application Support/Shisa.ai/JouzuDesktop` (macOS), `$XDG_DATA_HOME/Shisa.ai/JouzuDesktop` (Linux, default `~/.local/share/...`) |
+
+- The Jouzu home on Windows is the same folder the runtime's own start-up uses, so Desktop and
+  `jz` in a terminal share one set of sessions and settings. Desktop runs the runtime with that
+  home; it never copies, rewrites or migrates it, and a different `JOUZU_HOME` is followed as is.
+- Uninstalling Desktop never deletes the Jouzu home, even when you choose to delete app data.
+- A `data` folder that an earlier Desktop version left inside the Desktop folder is no longer
+  used; Desktop does not read, copy or move it.
+- `logs/` in the Desktop folder holds the app and host logs (`host.log` records timing for every
+  session step) and any crash records. **Settings → System → Open the log folder** opens it.
 
 ## Repository layout
 
@@ -98,8 +113,10 @@ npm ci
 npm run dev:isolated   # run the app with its own data folder, never your real one
 ```
 
-`dev:isolated` keeps everything under a separate `JouzuDesktopDev` folder (override with
-`JOUZU_LAUNCHER_DEV_HOME`), so a development run cannot touch an installed app's data.
+`dev:isolated` keeps everything, including the Jouzu home, under a separate `JouzuDesktopDev`
+folder (override with `JOUZU_LAUNCHER_DEV_HOME`), so a development run cannot touch an
+installed app or your real Jouzu sessions. Any other run without `JOUZU_HOME` uses the real
+Jouzu home.
 
 ### Tests
 
