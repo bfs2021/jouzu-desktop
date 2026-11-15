@@ -10,7 +10,6 @@ mod logs;
 mod bug_report;
 mod command_path;
 mod managed_paths;
-mod migration;
 mod host_bootstrap;
 mod recovery;
 mod runtime_install;
@@ -578,8 +577,6 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(update_channel::Pending::default())
         .setup(|app| {
-            migration::migrate_legacy_launcher_data()
-                .map_err(std::io::Error::other)?;
             if let Ok(managed) = runtime::managed_root() {
                 logs::append(
                     &managed,

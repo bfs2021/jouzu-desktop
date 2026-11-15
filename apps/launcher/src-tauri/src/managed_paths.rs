@@ -35,8 +35,11 @@ pub fn managed_root() -> Result<PathBuf, String> {
     }
 }
 
-/// The home Jouzu runs with: what the user asked for, otherwise the data directory of this
-/// installation.
+/// The home Jouzu runs with. Desktop does not own Jouzu's data: sessions, settings and
+/// credentials stay in Jouzu's own home, which `jz` uses too, and nothing is copied (#90).
+/// That is the user's `JOUZU_HOME` when set, otherwise the home the installed runtime's
+/// bootstrap defaults to (`packaging/launcher/bootstrap.mjs`). It does not depend on where
+/// Desktop itself is installed.
 pub fn effective_home() -> Result<PathBuf, String> {
     #[cfg(debug_assertions)]
     if std::env::var_os("JOUZU_LAUNCHER_DEV_HOME").is_some() {
@@ -45,5 +48,20 @@ pub fn effective_home() -> Result<PathBuf, String> {
     if let Some(home) = std::env::var_os("JOUZU_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(home));
     }
+    jouzu_default_home()
+}
+
+/// Jouzu's default home, the same expression as the bootstrap's
+/// `JOUZU_HOME ||= <LOCALAPPDATA>\Shisa.ai\Jouzu\data`.
+#[cfg(windows)]
+fn jouzu_default_home() -> Result<PathBuf, String> {
+    let local = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?;
+    Ok(PathBuf::from(local).join("Shisa.ai").join("Jouzu").join("data"))
+}
+
+/// The bootstrap defines a default only on Windows, the one platform Desktop ships on;
+/// elsewhere the home stays beside the installation.
+#[cfg(not(windows))]
+fn jouzu_default_home() -> Result<PathBuf, String> {
     Ok(managed_root()?.join("data"))
 }

@@ -1,6 +1,6 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::ExitCode,
     time::Instant,
 };
@@ -26,6 +26,19 @@ fn arg_values(args: &[String], name: &str) -> Vec<String> {
         .filter(|(_, value)| value.as_str() == name)
         .filter_map(|(index, _)| args.get(index + 1).cloned())
         .collect()
+}
+
+/// `JOUZU_HOME` when set, else the runtime bootstrap's default
+/// (`<LOCALAPPDATA>\Shisa.ai\Jouzu\data`).
+fn jouzu_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("JOUZU_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    if cfg!(windows) {
+        let local = std::env::var_os("LOCALAPPDATA")?;
+        return Some(PathBuf::from(local).join("Shisa.ai").join("Jouzu").join("data"));
+    }
+    None
 }
 
 fn usage() {
@@ -82,13 +95,14 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Jouzu's home is the runtime's, not Desktop's: the shell passes it, and on
+    // its own the host resolves it the way the runtime bootstrap does (#90).
     let runtime_home = arg_value(&args, "--runtime-home")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home.join("data"));
-    let managed = runtime_home
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| home.clone());
+        .unwrap_or_else(|| jouzu_home().unwrap_or_else(|| home.join("data")));
+    // The installation (Node, app, Git) lives under the host home, wherever
+    // Jouzu's data is.
+    let managed = home.clone();
     let runtime = arg_value(&args, "--runtime")
         .map(|program| RuntimeSpec {
             program: PathBuf::from(program),
