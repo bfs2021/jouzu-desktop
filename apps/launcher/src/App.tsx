@@ -198,6 +198,7 @@ export function App() {
   const language = setup?.language;
   const languageWritable = !!language && language.status !== "invalid" && language.status !== "future";
   const artifactChoice = language ? artifactPreset(language.artifactPolicy.effective) : "default";
+  const [firstRunReply, setFirstRunReply] = useState<string | null>(null);
   function chooseLocale(value: Locale) {
     setLocale(value);
     if (language && languageWritable && language.uiLocale.requested !== value) void configure({ action: "language", uiLocale: value });
@@ -557,22 +558,39 @@ export function App() {
       </div>
     </div>
   </main>;
-  // The interface and reply language controls, shared by first-run and Settings. Both
-  // are Jouzu's own settings (localization.json); first-run asks them separately, as Jouzu does.
+  // Settings' interface and reply language controls; both are Jouzu's own settings (localization.json).
   const interfaceLanguageSelect = <Select value={locale} onValueChange={value => chooseLocale(value as Locale)}><SelectTrigger aria-label={t.language} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(locales).map(([key,label]) => <SelectItem key={key} value={key}>{label}</SelectItem>)}</SelectContent></Select>;
   const replyLanguageField = <div className="space-y-2"><Label htmlFor="response-language">{t.responseLanguage}</Label>
                         <Select value={language?.responseLanguage.requested ?? "auto"} disabled={busy || !languageWritable} onValueChange={value => void configure({ action: "language", responseLanguage: value })}><SelectTrigger id="response-language" aria-label={t.responseLanguage} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{RESPONSE_LANGUAGES.map(key => <SelectItem key={key} value={key}>{key === "auto" ? t.responseAuto : locales[key]}</SelectItem>)}</SelectContent></Select>
                         <p className="text-sm leading-relaxed text-muted-foreground">{t.responseLanguageHint}</p></div>;
-  // The one setup page: language first, as Jouzu's first run asks it, then connecting a model.
+  // First run asks the languages on their own page before connecting a model, in Jouzu's
+  // order: the interface language, then the reply language, which suggests the interface
+  // language until it is chosen. Nothing is saved until Continue saves both.
+  const firstRunReplyValue = firstRunReply ?? locale;
+  const languageSetupScreen = <main className="flex h-screen w-full flex-col overflow-hidden bg-background">
+    {firstRunControls}
+    {onboardingBanner(t.setupLanguage, undefined, 0.55, false, true)}
+    <div className="flex min-h-0 flex-1 justify-center overflow-auto px-6 py-8">
+      <div data-slot="page-body" className="onboarding-card m-auto w-full max-w-2xl rounded-2xl border border-border bg-card/70 p-6 shadow-[0_28px_70px_-40px_rgba(0,0,0,0.95)] backdrop-blur-sm sm:p-8">
+        <p className="mb-6 text-sm leading-relaxed text-muted-foreground">{t.setupLanguageHint}</p>
+        {error?.place === "settings" && <div className="mb-4">{errorNotice("settings")}</div>}
+        <div className="space-y-5">
+          <div className="space-y-2"><Label htmlFor="first-run-interface">{t.language}</Label>
+            <Select value={locale} disabled={busy} onValueChange={value => setLocale(value as Locale)}><SelectTrigger id="first-run-interface" aria-label={t.language} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(locales).map(([key,label]) => <SelectItem key={key} value={key}>{label}</SelectItem>)}</SelectContent></Select></div>
+          <div className="space-y-2"><Label htmlFor="first-run-reply">{t.responseLanguage}</Label>
+            <Select value={firstRunReplyValue} disabled={busy} onValueChange={setFirstRunReply}><SelectTrigger id="first-run-reply" aria-label={t.responseLanguage} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{RESPONSE_LANGUAGES.map(key => <SelectItem key={key} value={key}>{key === "auto" ? t.responseAuto : locales[key]}</SelectItem>)}</SelectContent></Select>
+            <p className="text-sm leading-relaxed text-muted-foreground">{t.responseLanguageHint}</p></div>
+        </div>
+        <div className="mt-8 flex justify-end"><Button disabled={busy} onClick={() => void configure({ action: "language", uiLocale: locale, responseLanguage: firstRunReplyValue })}>{t.setupContinue}</Button></div>
+      </div>
+    </div>
+  </main>;
+  // Then the one remaining setup page: connecting a model.
   const modelSetupScreen = <main className="flex h-screen w-full flex-col overflow-hidden bg-background">
     {firstRunControls}
     {onboardingBanner(t.setupConnect, undefined, 0.55, false, true)}
     <div className="flex min-h-0 flex-1 justify-center overflow-auto px-6 py-8">
       <div data-slot="page-body" className="onboarding-card m-auto w-full max-w-2xl rounded-2xl border border-border bg-card/70 p-6 shadow-[0_28px_70px_-40px_rgba(0,0,0,0.95)] backdrop-blur-sm sm:p-8">
-        <section aria-label={t.setupLanguage} className="mb-6 space-y-4 border-b border-border pb-6">
-          <div className="space-y-2"><Label>{t.language}</Label>{interfaceLanguageSelect}</div>
-          {replyLanguageField}
-        </section>
         <p className="mb-6 text-sm leading-relaxed text-muted-foreground">{t.setupHint}</p>
         {error?.place === "settings" && <div className="mb-4">{errorNotice("settings")}</div>}
         {providerContent}
@@ -581,6 +599,8 @@ export function App() {
   </main>;
   if (runtimePresent === null) return connectingScreen;
   if (runtimePresent === false) return prepareScreen;
+  // Only a first run asks: no saved language settings yet. A file Jouzu cannot read is not a first run.
+  if (setup && setup.modelReady === false && setup.language?.status === "absent") return languageSetupScreen;
   if (setup && setup.modelReady === false) return modelSetupScreen;
   return <main aria-busy={busy || undefined} className="flex h-screen w-full flex-col overflow-hidden">
     <span role="status" aria-live="polite" className="sr-only">{busy || notice ? (operation === "preparing" ? t.preparing : operation === "launching" ? t.launching : operation === "choosing" ? t.choosing : operation === "saving" ? t.saving : notice ? t[notice] : null) : state && !state.ready ? t.repair : ""}</span>
