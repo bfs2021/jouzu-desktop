@@ -38,7 +38,7 @@ call, steering while running, Stop/abort, New chat and continuation. Results are
 `ui-flow-result.json`.
 
 The native Resume file picker is not automatable through CDP; `switch_session` is covered by
-the RPC matrix and the picker has a manual acceptance checklist in the handoff.
+the RPC matrix and the picker is checked by hand during release acceptance.
 
 ## Language settings
 

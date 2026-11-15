@@ -29,6 +29,14 @@ same sign-ins, so what QA tests is the upgrade a real user will take. Switching 
   stable. Stable never moves backwards.
 - Versions are plain `MAJOR.MINOR.PATCH`, increasing across both channels.
 
+## How a QA installation looks
+
+A QA installation shows the Jouzu icon with a **QA** badge on its window, taskbar, tray and
+the Start menu, desktop and pinned shortcuts that start it, so testers never mistake it for a
+stable one. QA and stable are the same build, so the badge is not baked into the executable:
+the app picks the icon from the channel at startup and whenever the channel changes, and
+switching back to stable restores the normal icon.
+
 ## Rules for QA builds
 
 - A QA installation follows the newest of the QA and stable feeds, so a promoted release
