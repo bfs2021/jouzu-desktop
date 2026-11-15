@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.1 - 2026-11-15
+
+QA channel fixes.
+
+- A Shisa API key saved in Settings takes effect after "Refresh models", without restarting
+  the app (#63).
+- The image tool offers a provider only when it can generate images for your account; any
+  other provider is listed with the reason it cannot be used (#64).
+- The image tool lists every provider the model runtime has image models for, not only
+  Shisa.AI, and generates through the runtime with them (#65).
+- Settings has a Language page that shows and changes Jouzu's interface and reply language,
+  shared with Jouzu in a terminal; first run asks for both before connecting a model (#66).
+- Opening Settings → Tools before any tools settings were saved no longer blanks the
+  window (#67).
+
 ## 1.1.0 - 2026-11-15
 
 First release on the QA channel (Settings → System). It shares your data and sign-ins with
