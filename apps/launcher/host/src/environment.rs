@@ -132,6 +132,18 @@ pub fn read(home: &Path) -> Result<Vec<Entry>, String> {
     Ok(entries)
 }
 
+/// The enabled saved variables, read from disk at the moment of the call. Every
+/// process the host starts (configuration service, warm and session runtimes)
+/// calls this at start, so a saved change applies to the next process without a
+/// host restart and nothing holds a stale copy.
+pub fn enabled(home: &Path) -> Result<Vec<(String, String)>, String> {
+    Ok(read(home)?
+        .into_iter()
+        .filter(|entry| entry.enabled)
+        .map(|entry| (entry.name, entry.value))
+        .collect())
+}
+
 pub fn save(home: &Path, entries: &[Entry]) -> Result<(), String> {
     validate(entries)?;
     std::fs::create_dir_all(home).map_err(|_| "Cannot create settings directory")?;
@@ -144,4 +156,39 @@ pub fn save(home: &Path, entries: &[Entry]) -> Result<(), String> {
         .map_err(|_| "Cannot save environment settings")?;
     std::fs::rename(&temp, &target)
         .map_err(|_| "Cannot replace environment settings".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn entry(name: &str, value: &str, enabled: bool) -> Entry {
+        Entry { name: name.into(), value: value.into(), enabled }
+    }
+
+    #[test]
+    fn nothing_saved_is_an_empty_list() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(enabled(home.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_error_not_an_empty_list() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(path(home.path()), b"not protected data").unwrap();
+        assert!(enabled(home.path()).is_err());
+    }
+
+    /// Issue #63: a value saved now is what the next read returns, and disabled
+    /// entries are left out.
+    #[cfg(windows)]
+    #[test]
+    fn the_next_read_sees_what_was_just_saved() {
+        let home = tempfile::tempdir().unwrap();
+        save(home.path(), &[entry("SHISA_API_KEY", "first", true), entry("OFF", "x", false)]).unwrap();
+        assert_eq!(enabled(home.path()).unwrap(), vec![("SHISA_API_KEY".to_string(), "first".to_string())]);
+        save(home.path(), &[entry("SHISA_API_KEY", "second", true)]).unwrap();
+        assert_eq!(enabled(home.path()).unwrap(), vec![("SHISA_API_KEY".to_string(), "second".to_string())]);
+    }
 }

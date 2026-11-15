@@ -18,9 +18,9 @@ pub struct ControlContext {
     pub root: PathBuf,
     /// The active Jouzu app passed as the adapter's second argument.
     pub app: PathBuf,
+    /// The runtime home: `JOUZU_HOME` for the adapter, and the folder whose
+    /// `launcher-environment.bin` holds the variables saved in Settings.
     pub home: PathBuf,
-    /// Saved environment entries, applied after `JOUZU_HOME`.
-    pub environment: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +41,9 @@ pub struct DeviceCode {
     pub code: String,
 }
 
-pub fn spec(context: &ControlContext) -> Result<LaunchSpec, String> {
+/// `environment` is the saved variables read for this launch; it is applied after
+/// `JOUZU_HOME`.
+pub fn spec(context: &ControlContext, environment: &[(String, String)]) -> Result<LaunchSpec, String> {
     if SCRIPT.len() > MAX_SCRIPT_BYTES {
         return Err("Control adapter is too large for the command line".into());
     }
@@ -66,7 +68,7 @@ pub fn spec(context: &ControlContext) -> Result<LaunchSpec, String> {
         "JOUZU_HOME".to_string(),
         context.home.to_string_lossy().into_owned(),
     )];
-    env.extend(context.environment.iter().cloned());
+    env.extend(environment.iter().cloned());
     Ok(LaunchSpec {
         program: super::app::process_path(&context.node),
         args,
@@ -135,33 +137,36 @@ mod tests {
         node
     }
 
+    fn saved() -> Vec<(String, String)> {
+        vec![("EXAMPLE".into(), "1".into())]
+    }
+
     fn context() -> ControlContext {
         ControlContext {
             node: node(),
             root: PathBuf::from(r"C:\managed"),
             app: PathBuf::from(r"C:\managed\app"),
             home: PathBuf::from(r"C:\managed\data"),
-            environment: vec![("EXAMPLE".into(), "1".into())],
         }
     }
 
     #[test]
     fn the_script_fits_the_command_line() {
         assert!(SCRIPT.len() <= MAX_SCRIPT_BYTES, "adapter grew to {} bytes", SCRIPT.len());
-        assert!(spec(&context()).is_ok());
+        assert!(spec(&context(), &saved()).is_ok());
     }
 
     #[test]
     fn a_missing_bundled_node_is_an_error_not_a_fallback() {
         let mut context = context();
         context.node = PathBuf::from(r"C:\nowhere\runtime\node\node.exe");
-        let error = spec(&context).unwrap_err();
+        let error = spec(&context, &saved()).unwrap_err();
         assert!(error.contains("bundled Node.js is missing"), "{error}");
     }
 
     #[test]
     fn the_spec_passes_root_and_app_positionally() {
-        let spec = spec(&context()).unwrap();
+        let spec = spec(&context(), &saved()).unwrap();
         assert!(spec.program.ends_with("node.exe"));
         assert_eq!(spec.args[0], "--input-type=module");
         assert_eq!(spec.args[1], "--eval");
@@ -174,7 +179,7 @@ mod tests {
 
     #[test]
     fn the_spec_sets_jouzu_home_before_saved_environment() {
-        let spec = spec(&context()).unwrap();
+        let spec = spec(&context(), &saved()).unwrap();
         assert_eq!(spec.env[0], ("JOUZU_HOME".to_string(), r"C:\managed\data".to_string()));
         assert_eq!(spec.env[1], ("EXAMPLE".to_string(), "1".to_string()));
     }

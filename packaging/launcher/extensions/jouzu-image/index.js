@@ -87,10 +87,19 @@ async function runtimeModule(relative) {
   throw new Error("The runtime's coding-agent package could not be found.");
 }
 
-/** The runtime's credential API. Injectable so the tests do not need the runtime. */
+/**
+ * The provider's credential, read the way the runtime reads it. A provider that
+ * knows its runtime's rule (Shisa: SHISA_API_KEY, then an unexpired sign-in)
+ * resolves it itself; any other provider uses the runtime's stored credential.
+ * Injectable so the tests do not need the runtime.
+ */
 let credentialReader = async providerId => {
   // The runtime sets PI_CODING_AGENT_DIR; the CLI mode sets it from JOUZU_HOME.
   process.env.PI_CODING_AGENT_DIR ||= join(home(), "agent");
+  const provider = OWN_PROVIDERS[providerId];
+  if (provider?.credential) {
+    return provider.credential({ env: process.env, agentDir: process.env.PI_CODING_AGENT_DIR, runtimeModule });
+  }
   const { readStoredCredential } = await runtimeModule("@earendil-works/pi-coding-agent/dist/index.js");
   return readStoredCredential(providerId);
 };
@@ -118,33 +127,51 @@ async function registryFor(ctx) {
   return ctx?.modelRegistry ?? registryLoader();
 }
 
-async function hasCredential(providerId) {
-  try {
-    const credential = await credentialReader(providerId);
-    const value = credential?.access ?? credential?.key ?? credential?.apiKey;
-    return typeof value === "string" && value.trim().length > 0;
-  } catch {
-    return false;
-  }
-}
-
-/** Every image provider with whether it has a credential now: own adapters first, then the runtime's. */
+/**
+ * Every image provider with whether it can generate images now, and why not:
+ * own adapters first, then the runtime's. A usable provider carries its models.
+ */
 export async function listProviders(registry) {
   const runtime = await listRuntimeProviders(registry);
   const listed = new Set(runtime.map(provider => provider.id));
   const own = await Promise.all(Object.values(OWN_PROVIDERS)
     .filter(provider => !listed.has(provider.id))
-    .map(async provider => ({ id: provider.id, label: provider.label ?? provider.id, available: await hasCredential(provider.id) })));
-  return [...own, ...runtime];
+    .map(async provider => ({ id: provider.id, label: provider.label ?? provider.id, ...(await availability(provider)) })));
+  const fromRuntime = runtime.map(provider => provider.available
+    ? { ...provider, models: listRuntimeModels(registry, provider.id) }
+    : { ...provider, reason: `No credential for ${provider.label}. Add one under Model providers to generate images with it.` });
+  return [...own, ...fromRuntime];
 }
 
 export async function token(providerId) {
   const credential = await credentialReader(providerId);
   const value = credential?.access ?? credential?.key ?? credential?.apiKey;
   if (typeof value !== "string" || !value.trim()) {
-    throw new Error(providerId === "shisa" ? "Sign in to Shisa.AI to generate images." : `No credential for ${providerId}.`);
+    throw new Error(OWN_PROVIDERS[providerId]?.signInHint ?? `No credential for ${providerId}.`);
   }
   return { token: value.trim(), type: credential?.type ?? "unknown" };
+}
+
+/**
+ * Whether an own adapter can generate images for this user right now: it has a
+ * credential by the runtime's rules and the account lists at least one image
+ * model. The Tools page offers only providers that can; the others carry the
+ * reason they cannot.
+ */
+export async function availability(provider) {
+  let value;
+  try {
+    value = (await token(provider.id)).token;
+  } catch (error) {
+    return { available: false, reason: String(error?.message ?? error) };
+  }
+  try {
+    const models = await provider.listModels(value);
+    if (!models.length) return { available: false, reason: "This account has no image models." };
+    return { available: true, models: models.map(id => ({ id, sizes: provider.sizes?.(id) ?? SIZES })) };
+  } catch (error) {
+    return { available: false, reason: String(error?.message ?? error) };
+  }
 }
 
 /**
@@ -340,6 +367,7 @@ export default function jouzuImage(pi) {
 }
 
 // CLI entry for the desktop's Tools page: node index.js --providers | --models <id>
+// --providers reports each provider with whether it is usable, and why not.
 const invoked = typeof process.argv[1] === "string" && /index\.(m?js)$/.test(process.argv[1]);
 if (invoked && process.argv[2]?.startsWith("--")) {
   const command = process.argv[2];

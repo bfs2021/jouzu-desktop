@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension, { listModels, listProviders, setCredentialReader, setRegistryLoader } from "../../../packaging/launcher/extensions/jouzu-image/index.js";
+import extension, { availability, listModels, listProviders, setCredentialReader, setRegistryLoader } from "../../../packaging/launcher/extensions/jouzu-image/index.js";
+import shisa from "../../../packaging/launcher/extensions/jouzu-image/providers/shisa.mjs";
 
 function load() {
   const tools = [];
@@ -188,21 +189,24 @@ describe("generate_image extension", () => {
     expect(result.details.size).toBe("1K");
   });
 
-  it("lists the runtime's image providers beside Shisa, with whether each has a credential", async () => {
+  it("lists the runtime's image providers beside Shisa, each usable with its models or with the reason it is not", async () => {
+    vi.mocked(fetch).mockResolvedValue(ok({ models: [{ name: "models/gemini-3.1-flash-lite-image" }] }));
     const providers = await listProviders(registry({ models: [flux, gemini], available: [] }));
     expect(providers).toEqual([
-      { id: "shisa", label: "Shisa.AI", available: true },
-      { id: "openrouter", label: "OpenRouter", available: false },
+      { id: "shisa", label: "Shisa.AI", available: true, models: [{ id: "gemini-3.1-flash-lite-image", sizes: ["1K"] }] },
+      { id: "openrouter", label: "OpenRouter", available: false, reason: "No credential for OpenRouter. Add one under Model providers to generate images with it." },
     ]);
-    const models = await listModels(registry({ models: [flux, gemini] }), "openrouter");
+    const usable = await listProviders(registry({ models: [flux, gemini] }));
     // The runtime's image API takes no size, so its models offer none.
+    expect(usable[1]).toEqual({ id: "openrouter", label: "OpenRouter", available: true, models: [{ id: flux.id, sizes: [] }, { id: gemini.id, sizes: [] }] });
+    const models = await listModels(registry({ models: [flux, gemini] }), "openrouter");
     expect(models).toEqual([{ id: flux.id, sizes: [] }, { id: gemini.id, sizes: [] }]);
   });
 
-  it("marks Shisa unavailable without a credential instead of hiding it", async () => {
+  it("marks Shisa unavailable without a credential, with the reason, instead of hiding it", async () => {
     setCredentialReader(async () => undefined);
     const providers = await listProviders(registry());
-    expect(providers).toEqual([{ id: "shisa", label: "Shisa.AI", available: false }]);
+    expect(providers).toEqual([{ id: "shisa", label: "Shisa.AI", available: false, reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." }]);
   });
 
   it("generates with a runtime provider through the runtime's registry, never its own request", async () => {
@@ -268,5 +272,64 @@ describe("generate_image extension", () => {
     process.env.JOUZU_HOME = home;
     const { tool } = load();
     await expect(tool.execute("call", { prompt: "a cat" }, undefined, undefined, { modelRegistry: registry({ models: [flux] }) })).rejects.toThrow("Unknown image provider: nobody");
+  });
+});
+
+// #64: the Tools page offers a provider only when it can generate images now.
+describe("image provider availability", () => {
+  beforeEach(() => vi.stubGlobal("fetch", vi.fn()));
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("is unavailable without a credential, and says how to get one", async () => {
+    setCredentialReader(async () => undefined);
+    const result = await availability(shisa);
+    expect(result).toEqual({ available: false, reason: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images." });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("is unavailable when the account cannot use image generation", async () => {
+    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 403, json: async () => ({ code: 311 }) });
+    expect(await availability(shisa)).toEqual({ available: false, reason: "This account cannot use image generation (shisa/image)." });
+  });
+
+  it("is unavailable when the account lists no image models", async () => {
+    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
+    vi.mocked(fetch).mockResolvedValue(ok({ models: [] }));
+    expect(await availability(shisa)).toEqual({ available: false, reason: "This account has no image models." });
+  });
+
+  it("is unavailable, not an error, when the provider cannot be reached", async () => {
+    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
+    vi.mocked(fetch).mockRejectedValue(new TypeError("fetch failed"));
+    expect(await availability(shisa)).toEqual({ available: false, reason: "Shisa.AI could not be reached." });
+  });
+
+  it("is available with the account's models and their sizes", async () => {
+    setCredentialReader(async () => ({ type: "oauth", access: "t" }));
+    vi.mocked(fetch).mockResolvedValue(ok({ models: [{ name: "models/gemini-3.1-flash-lite-image" }] }));
+    expect(await availability(shisa)).toEqual({ available: true, models: [{ id: "gemini-3.1-flash-lite-image", sizes: ["1K"] }] });
+  });
+});
+
+// The Shisa credential follows Jouzu's rule: sign-out, then SHISA_API_KEY, then an unexpired sign-in.
+describe("Shisa credential", () => {
+  const runtime = ({ signedOut = false, login = undefined } = {}) => async () => ({
+    isShisaSignedOut: () => signedOut,
+    readShisaLoginToken: () => login,
+  });
+
+  it("prefers SHISA_API_KEY over a sign-in", async () => {
+    const credential = await shisa.credential({ env: { SHISA_API_KEY: " key " }, agentDir: "a", runtimeModule: runtime({ login: "login" }) });
+    expect(credential).toEqual({ type: "api_key", key: "key" });
+  });
+
+  it("uses the runtime's sign-in token, which is absent once expired", async () => {
+    expect(await shisa.credential({ env: {}, agentDir: "a", runtimeModule: runtime({ login: "login" }) })).toEqual({ type: "oauth", access: "login" });
+    expect(await shisa.credential({ env: {}, agentDir: "a", runtimeModule: runtime() })).toBeUndefined();
+  });
+
+  it("has no credential after a local sign-out, even with SHISA_API_KEY", async () => {
+    expect(await shisa.credential({ env: { SHISA_API_KEY: "key" }, agentDir: "a", runtimeModule: runtime({ signedOut: true, login: "login" }) })).toBeUndefined();
   });
 });
