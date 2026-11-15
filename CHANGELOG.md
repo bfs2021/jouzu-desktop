@@ -1,11 +1,26 @@
 # Changelog
 
-## Unreleased
+## 1.1.3-rc.1 - 2026-11-15
 
+First release candidate for 1.1.3, on the QA channel.
+
+- Desktop uses Jouzu's own home (`%LOCALAPPDATA%\Shisa.ai\Jouzu\data`, or `JOUZU_HOME`
+  when set) and no longer copies Jouzu's data into a folder of its own, so Desktop and `jz`
+  in a terminal show the same sessions, settings and sign-ins (#90).
 - Settings has a Web access page. It shows who can connect besides this window and lets
   you allow a browser on this computer, or devices on trusted networks such as your local
   network or Tailscale. Every browser must be paired with a one-time code, and paired
   devices can be removed at any time. Web access stays off until you turn it on (#91).
+- A browser on another device opens the web UI over plain http instead of showing a blank
+  page, and its copy buttons work (#106).
+- The model list is built again after every settings change: models of an account you
+  signed out of disappear, and providers added later appear (#84).
+- The first start on a fresh install no longer stays on "Connecting to launcher…" after
+  Node, the app and Git are installed (#87).
+- The QA badge on the icon now comes with the QA package itself, installer included; the
+  app no longer changes its icon when you switch the update channel (#74).
+- QA releases are release candidates (`X.Y.Z-rc.N`). A stable release is built again from a
+  candidate that passed QA, with the normal icon (#86).
 
 ## 1.1.2 - 2026-11-15
 
