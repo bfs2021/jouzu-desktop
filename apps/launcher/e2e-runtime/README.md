@@ -64,3 +64,15 @@ message so the workspace has an entry session, then reopens the page while the f
 session lease is held for 4 s and the startup catalog refresh reports an activated revision,
 the order of the first start after an update (#73). Passes when the loader is gone and the
 entry session was opened. Results are written to `entry-restart-result.json`.
+
+## Turn files stay with their session
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_WS_A = '<workspace A>'; $env:JOUZU_E2E_WS_B = '<workspace B>'
+node e2e-runtime/turn-files-session.mjs
+```
+
+Needs the fixture provider and server, and both folders added as workspaces. Runs a turn in B,
+then a turn in A during which a file in A is written, then opens B's session: A's summary must
+list the file and B's must not (#79). Results are written to `turn-files-session-result.json`.
