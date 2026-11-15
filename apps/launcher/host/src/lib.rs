@@ -2576,6 +2576,62 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn the_hosts_own_flow_release_is_tagged_and_answered_after_its_reply() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let log_path = log.path().to_str().unwrap().to_string();
+        let (manager, _home, workspace) = manager_with_env(50, &[
+            ("FAKE_RUNTIME_PROMPT_LOG", &log_path),
+            ("FAKE_RUNTIME_DELAY_MS", "1000"),
+            ("FAKE_RUNTIME_FLOW_NOTICES", "1"),
+        ]);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        session.send("before-crash", "hello").unwrap();
+        wait_until(|| std::fs::read_to_string(&log_path).is_ok_and(|text| text.contains("hello"))).await;
+        let (_, crashed_at) = session.events_after(0);
+        let previous = session.runtime_pid().expect("runtime pid");
+        kill_tree(previous);
+        wait_until(|| {
+            session.status() == Status::Idle
+                && session.runtime_pid().is_some_and(|pid| pid != previous)
+                && session.events_after(crashed_at).0.iter().any(|event| event.event == "session.command_done")
+        })
+        .await;
+        let flow: Vec<String> = session
+            .events_after(crashed_at)
+            .0
+            .iter()
+            .filter(|event| event.event == "session.notice" || event.event == "session.command_done")
+            .map(|event| match event.event.as_str() {
+                "session.notice" => format!(
+                    "notice[{}]:{}",
+                    event.data["command"]["origin"].as_str().unwrap_or("-"),
+                    event.data["message"].as_str().unwrap_or("").split(':').next().unwrap_or("")
+                ),
+                _ => format!(
+                    "done[{}]:{}:{}",
+                    event.data["origin"].as_str().unwrap_or(""),
+                    event.data["text"].as_str().unwrap_or(""),
+                    event.data["success"]
+                ),
+            })
+            .collect();
+        // The recovery announcement runs on its own in the runtime, so it can land
+        // before or inside the release's window; only its place before the reply counts.
+        assert!(flow[0].ends_with(":Flow control is holding automated work"), "{flow:?}");
+        assert_eq!(
+            flow[1..],
+            [
+                "notice[host]:Flow clear released 1 request hold. Receipt evidence was preserved. Continue with a new message.",
+                "done[host]:/flow clear:true",
+            ],
+            "{flow:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_queued_follow_up_is_listed_after_the_reply_it_waited_for() {
         let (manager, _home, workspace) = manager(50);
         let session = manager

@@ -239,9 +239,39 @@ describe("SessionStore", () => {
     session.emit(event(1, "session.notice", { message: "Flow control is holding your message: budget. Run /flow for the control that releases it." }));
     await store.flow("clear");
     expect(session.sent).toMatchObject([{ text: "/flow clear" }]);
+    const id = (session.sent[0] as { clientMessageId: string }).clientMessageId;
+    const command = { id, text: "/flow clear", origin: "user" };
+    // Accepted is not answered: the banner stays until the runtime has replied.
+    expect(store.snapshot.flowHold).not.toBeNull();
+    session.emit(event(2, "session.notice", { message: "Flow clear released 1 request hold. Receipt evidence was preserved. Continue with a new message.", command }));
+    session.emit(event(3, "session.command_done", { ...command, success: true }));
     expect(store.snapshot.flowHold).toBeNull();
     await store.setTextGuardMode("off");
     expect(session.sent).toMatchObject([{ text: "/flow clear" }, { text: "/textguard off" }]);
+  });
+
+  it("keeps the banner when /flow clear reports a hold it could not lift", async () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    const command = { id: "c-1", text: "/flow clear", origin: "user" };
+    session.emit(event(1, "session.notice", { message: "Flow control is holding automated work: a withheld request needs a decision. Run /flow for the control that releases it." }));
+    session.emit(event(2, "session.notice", { message: "Flow clear preserved pending evidence that still needs reconciliation. Run /flow for the remaining hold.", level: "error", command }));
+    session.emit(event(3, "session.command_done", { ...command, success: true }));
+    expect(store.snapshot.flowHold).toEqual({ text: "Flow clear preserved pending evidence that still needs reconciliation.", paused: false });
+  });
+
+  it("ends the recovery hold banner when the host's own release is answered, without a notice", () => {
+    const session = fakeSession();
+    const store = SessionStore.attach(session);
+    const command = { id: "host-flow-release", text: "/flow clear", origin: "host" };
+    // The recovery announcement can come before the release or inside its window.
+    session.emit(event(1, "session.notice", { message: "Flow control is holding automated work: a withheld request needs a decision. Run /flow for the control that releases it." }));
+    session.emit(event(2, "session.notice", { message: "Flow control is holding automated work: a withheld request needs a decision. Run /flow for the control that releases it.", command }));
+    expect(store.snapshot.flowHold).not.toBeNull();
+    session.emit(event(3, "session.notice", { message: "Flow clear released 1 request hold. Receipt evidence was preserved. Continue with a new message.", command }));
+    session.emit(event(4, "session.command_done", { ...command, success: true }));
+    expect(store.snapshot.flowHold).toBeNull();
+    expect(store.snapshot.notice).toBeUndefined();
   });
 
   it("keeps a reply with its own turn when a follow-up was accepted first", async () => {

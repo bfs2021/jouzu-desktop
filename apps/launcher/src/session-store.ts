@@ -11,7 +11,7 @@ import { eventRouter } from "./event-router";
 import type { ApiEvent, Attachment, HistoryPage, JouzuApi, Receipt, TimingMark } from "./api/jouzu-api";
 import { emptyProjection, historyRowsProjection, hostBlocks, hostToolResults, type ChatBlock, type ChatMessage, type FlowReportRecord, type ToolView } from "./chat-projection";
 import { describeError } from "./runtime-errors";
-import { classifyNotice, type TextGuardMode } from "./session-notices";
+import { classifyNotice, type SessionNotice, type TextGuardMode } from "./session-notices";
 import {
   readModelPreference,
   writeModelPreference,
@@ -67,6 +67,20 @@ const modelOf = (model: Awaited<ReturnType<JouzuApi["models"]["list"]>>[number])
 
 type Data = Record<string, unknown>;
 const text = (value: unknown): string | undefined => typeof value === "string" ? value : undefined;
+
+/** A slash command the host wrote to the runtime: who issued it, and its text. */
+type CommandRef = { id: string; text: string; origin: "host" | "user" };
+
+const commandOf = (value: unknown): (CommandRef & { success?: boolean }) | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const data = value as Record<string, unknown>;
+  const id = text(data.id), command = text(data.text);
+  if (!id || !command) return undefined;
+  return { id, text: command, origin: data.origin === "host" ? "host" : "user", ...(typeof data.success === "boolean" ? { success: data.success } : {}) };
+};
+
+/** The Flow commands whose purpose is to end a hold or pause. */
+const releasesFlow = (command: string): boolean => /^\/flow\s+(?:clear|resume|off)\s*$/u.test(command.trim());
 const record = (value: unknown): Data | undefined => value && typeof value === "object" && !Array.isArray(value) ? value as Data : undefined;
 const time = (value: unknown): number | undefined => {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -199,6 +213,8 @@ export class SessionStore {
   private preferred = readModelPreference();
   private api?: JouzuApi;
   private noticeSeq = 0;
+  /** The last reply of each open Flow command that releases a hold, by command id. */
+  private flowReplies = new Map<string, SessionNotice | null>();
   private shownOutput: string | null = null;
 
   private constructor(
@@ -467,12 +483,11 @@ export class SessionStore {
 
   /**
    * The Flow controls a held message needs: clear releases the hold, resume
-   * lifts a pause, off lets retained input run natively. A successful command
-   * ends the hold banner; the runtime's reply arrives as a notice.
+   * lifts a pause, off lets retained input run natively. The command's own
+   * last reply settles the hold banner when the host says it was answered.
    */
   async flow(verb: "clear" | "resume" | "off" | "on" | "status"): Promise<void> {
     await this.runCommand(verb === "status" ? "/flow" : `/flow ${verb}`);
-    if (verb === "clear" || verb === "resume" || verb === "off") this.update({ flowHold: null });
   }
 
   dismissFlowHold(): void {
@@ -661,9 +676,15 @@ export class SessionStore {
     if ("activeTurn" in data) this.applyTurn(activeTurnOf(data.activeTurn));
   }
 
-  private applyNotice(message: string, level: unknown): void {
+  private applyNotice(message: string, level: unknown, command?: CommandRef): void {
     if (!message.trim()) return;
     const notice = classifyNotice(message, level);
+    if (command && releasesFlow(command.text)) {
+      this.flowReplies.set(command.id, notice);
+      // A release the host made on its own was not asked for: only a hold it
+      // could not lift is worth showing.
+      if (command.origin === "host" && notice.kind !== "flow-hold") return;
+    }
     if (notice.kind === "textguard-mode") {
       this.update({ textguard: { ...this.state.textguard, mode: notice.mode }, notice: { id: ++this.noticeSeq, text: notice.text, level: "info" } });
     } else if (notice.kind === "textguard-alert") {
@@ -673,6 +694,20 @@ export class SessionStore {
     } else {
       this.update({ notice: { id: ++this.noticeSeq, text: notice.text, level: notice.level } });
     }
+  }
+
+  /**
+   * A Flow command that releases a hold was answered. Its last reply is the
+   * runtime's verdict: a hold it still reports stays on screen, anything else
+   * means nothing is held any more. Earlier hold notices cannot outlive it.
+   */
+  private settleCommand(command?: CommandRef & { success?: boolean }): void {
+    if (!command || !releasesFlow(command.text)) return;
+    const reply = this.flowReplies.get(command.id);
+    this.flowReplies.delete(command.id);
+    if (command.success === false) return;
+    if (reply?.kind === "flow-hold") this.update({ flowHold: { text: reply.text, paused: reply.paused } });
+    else this.update({ flowHold: null });
   }
 
   private ensureAssistant(turnId?: string): number {
@@ -840,7 +875,10 @@ export class SessionStore {
         break;
       }
       case "session.notice":
-        this.applyNotice(text(data.message) ?? "", data.level);
+        this.applyNotice(text(data.message) ?? "", data.level, commandOf(data.command));
+        break;
+      case "session.command_done":
+        this.settleCommand(commandOf(data));
         break;
       case "error":
         // Turn state is not touched here: the host's summary says whether the turn ended.

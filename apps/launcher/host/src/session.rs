@@ -550,6 +550,10 @@ pub struct Session {
     /// withholds it (and any new input) until someone decides; the host already
     /// decided (the turn failed), so recovery releases the hold before going idle.
     release_flow_hold: AtomicBool,
+    /// Slash commands written to the runtime and not yet answered, oldest first.
+    /// A command's replies are notices the runtime emits before it answers, so a
+    /// notice published while one is open is tagged with it (see `notice_origin`).
+    commands: Mutex<Vec<(String, String)>>,
     cancelled: Mutex<HashMap<String, Instant>>,
     failed_turn: Mutex<Option<Value>>,
     listed: Mutex<bool>,
@@ -1616,6 +1620,16 @@ impl Session {
     }
 
     fn write_command(&self, value: Value) -> Result<(), ApiError> {
+        let command = matches!(value.get("type").and_then(Value::as_str), Some("prompt" | "steer"))
+            .then(|| (value.get("id").and_then(Value::as_str), value.get("message").and_then(Value::as_str)))
+            .and_then(|(id, text)| Some((id?.to_string(), text?.trim().to_string())))
+            .filter(|(_, text)| text.starts_with('/'));
+        if let Some(command) = command.clone() {
+            self.commands
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(command);
+        }
         let runtime = self
             .runtime
             .lock()
@@ -1630,6 +1644,9 @@ impl Session {
                 )
             })?;
         runtime.enqueue(value).map_err(|message| {
+            if let Some((id, _)) = &command {
+                self.command_answered(id);
+            }
             ApiError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "runtime-unavailable",
@@ -1707,9 +1724,36 @@ impl Session {
         }
     }
 
+    /// The slash command open while a notice arrived: the newest one. The
+    /// runtime runs a command's handler to the end before it answers, so every
+    /// reply of a command carries it, and its last reply comes last. Notices the
+    /// runtime raises on its own (a recovery announcement) can land in the same
+    /// window; they carry it too, which is why only the last reply settles state.
+    fn notice_origin(&self) -> Option<Value> {
+        let commands = self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        commands.last().map(|(id, text)| {
+            json!({ "id": id, "text": text, "origin": if id == FLOW_RELEASE_ID { "host" } else { "user" } })
+        })
+    }
+
+    /// A slash command was answered: every reply it had is published. Tell
+    /// clients, so state its replies settle (a Flow hold) can be settled.
+    fn command_answered(&self, id: &str) -> Option<Value> {
+        let done = {
+            let mut commands = self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let at = commands.iter().position(|(open, _)| open == id)?;
+            commands.remove(at)
+        };
+        Some(json!({ "id": done.0, "text": done.1, "origin": if done.0 == FLOW_RELEASE_ID { "host" } else { "user" } }))
+    }
+
     fn handle_response(self: &Arc<Self>, value: &Value) {
         let command = value.get("command").and_then(Value::as_str).unwrap_or("");
         let response_id = value.get("id").and_then(Value::as_str).unwrap_or("");
+        if let Some(mut done) = self.command_answered(response_id) {
+            done["success"] = value.get("success").cloned().unwrap_or(Value::Null);
+            self.publish("session.command_done", done);
+        }
         if response_id == FLOW_RELEASE_ID {
             log(
                 &self.home,
@@ -2492,10 +2536,11 @@ impl Session {
                     Some("warning") => "warning",
                     _ => "info",
                 };
-                self.publish(
-                    "session.notice",
-                    json!({ "message": message, "level": level }),
-                );
+                let mut notice = json!({ "message": message, "level": level });
+                if let Some(command) = self.notice_origin() {
+                    notice["command"] = command;
+                }
+                self.publish("session.notice", notice);
             }
             "setStatus" => {
                 let Some(key) = value.get("statusKey").and_then(Value::as_str) else {
@@ -4008,6 +4053,7 @@ impl Session {
             cancelling: AtomicBool::new(false),
             turn_running: AtomicBool::new(false),
             release_flow_hold: AtomicBool::new(false),
+            commands: Mutex::new(Vec::new()),
             cancelled: Mutex::new(HashMap::new()),
             failed_turn: Mutex::new(None),
             listed: Mutex::new(false),
@@ -4397,6 +4443,9 @@ impl Session {
                     "runtime.exited",
                     json!({ "code": code }),
                 );
+                // Commands still open went down with the runtime: none of them
+                // will answer, and none of their effects can be assumed.
+                self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
                 if !matches!(self.status(), Status::Stopped) {
                     let status = self.status();
                     let finalize = self.turn_running.load(Ordering::SeqCst)

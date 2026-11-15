@@ -11,6 +11,11 @@ const crashOnPrompt = process.env.FAKE_RUNTIME_CRASH_ON_PROMPT === "1";
 const tool = process.env.FAKE_RUNTIME_TOOL === "1";
 // Real runtimes answer "handled" when Flow keeps the input and no run starts.
 const handledPrompts = process.env.FAKE_RUNTIME_HANDLED === "1";
+// Like Flow after a crash: a reopened session announces its recovery hold, and
+// `/flow clear` replies with what it released before the command is answered.
+const flowNotices = process.env.FAKE_RUNTIME_FLOW_NOTICES === "1";
+const notify = (message, notifyType = "info") => out({ type: "extension_ui_request", id: `flow-${Math.random()}`, method: "notify", message, notifyType });
+if (flowNotices) setImmediate(() => notify("Flow control is holding automated work: a withheld request needs a decision. Run /flow for the control that releases it."));
 const garbage = process.env.FAKE_RUNTIME_GARBAGE === "1";
 const uiMethod = process.env.FAKE_RUNTIME_UI ?? "";
 const uiTimeout = Number(process.env.FAKE_RUNTIME_UI_TIMEOUT_MS ?? 0);
@@ -228,6 +233,7 @@ function requestUi(text) {
 function prompt(id, text, images) {
   if (handledPrompts || String(text).startsWith("/flow ")) {
     promptLog(text);
+    if (flowNotices && String(text).trim() === "/flow clear") notify("Flow clear released 1 request hold. Receipt evidence was preserved. Continue with a new message.");
     response(id, "prompt", { disposition: "handled" });
     return;
   }
