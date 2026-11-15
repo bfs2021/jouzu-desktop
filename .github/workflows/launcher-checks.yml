@@ -51,6 +51,14 @@ jobs:
           npm run test:node -- @tests
       - name: Rust toolchain
         run: rustup show active-toolchain
+      - name: Host build and tests
+        working-directory: apps/launcher
+        run: |
+          # The shell bundles the release host from host/target/package; build:app is the same
+          # step a release runs before Tauri compiles the shell.
+          npm run build:app
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path host/Cargo.toml
       - name: Native launcher tests
         working-directory: apps/launcher/src-tauri
         run: cargo test --locked --bins
