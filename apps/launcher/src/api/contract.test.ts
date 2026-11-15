@@ -101,6 +101,13 @@ function bridge() {
   };
   const settings: SettingsApi = {
     environment: { read: vi.fn(async () => [] as EnvironmentEntry[]), save: vi.fn(async () => undefined) },
+    webAccess: {
+      read: vi.fn(async () => { throw new Error('unused'); }),
+      update: vi.fn(async () => { throw new Error('unused'); }),
+      pair: vi.fn(async () => { throw new Error('unused'); }),
+      cancelPairing: vi.fn(async () => undefined),
+      revoke: vi.fn(async () => { throw new Error('unused'); }),
+    },
     control: vi.fn(async () => ({})),
   };
   const workspaces: WorkspaceApi = {

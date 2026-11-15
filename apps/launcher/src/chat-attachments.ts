@@ -1,4 +1,5 @@
 import type { ChatImage } from "./chat-types";
+import { newId } from "./secure-context";
 
 export const IMAGE_ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -146,7 +147,7 @@ export async function readImageAttachment(file: File): Promise<ImageAttachment> 
   assertMinimumImageSide(bytes, mimeType);
   const prepared = await fitForSend(bytes, mimeType);
   return {
-    id: crypto.randomUUID(),
+    id: newId(),
     name: file.name,
     size: prepared.bytes.length,
     image: { type: "image", data: toBase64(prepared.bytes), mimeType: prepared.mimeType },

@@ -92,6 +92,92 @@ async function imageProviderScenario() {
 }
 
 const settingsDialog = () => page.getByRole("dialog").first();
+/**
+ * Web access (#91, #106). Measures: with web access on, a browser must pair before
+ * it sees anything; a paired browser gets the full UI with no page error; a removed
+ * device is sent back to pairing; off closes the port. Why: who may connect was fixed
+ * in code and invisible, and plain-http access from another device crashed the UI
+ * (crypto.randomUUID is missing outside a secure context). When this machine has a
+ * local-network address the same check runs over it, which is a non-secure origin.
+ * Web access is set back to Off at the end.
+ */
+async function webAccessScenario() {
+  const visitor = await chromium.launch();
+  const openWebAccess = async () => {
+    await openSettingsTab("Web access");
+    return settingsDialog();
+  };
+  const choose = async (dialog, option) => {
+    await dialog.getByRole("combobox", { name: "Who can connect" }).click();
+    await page.getByRole("option", { name: option, exact: true }).click();
+  };
+  const save = async dialog => {
+    const button = dialog.getByRole("button", { name: "Save", exact: true });
+    if (await button.count()) await button.click();
+  };
+  const visit = async url => {
+    const context = await visitor.newContext();
+    const tab = await context.newPage();
+    const errors = [];
+    tab.on("pageerror", error => errors.push(String(error)));
+    await tab.goto(url);
+    await tab.waitForTimeout(3_000);
+    return { context, tab, errors };
+  };
+  try {
+    let dialog = await openWebAccess();
+    await choose(dialog, "This computer and trusted networks");
+    const lan = dialog.getByRole("switch").first();
+    const hasNetwork = await lan.count() > 0;
+    if (hasNetwork) {
+      if ((await lan.getAttribute("aria-checked")) !== "true") await lan.click();
+    } else {
+      await choose(dialog, "This computer only");
+    }
+    await save(dialog);
+    await dialog.getByText(/Serving at:/).waitFor({ timeout: 15_000 });
+    await dialog.getByRole("button", { name: "Pair a device" }).click();
+    const links = await dialog.getByRole("textbox").evaluateAll(nodes => nodes.map(node => node.value).filter(value => value.includes("/pair?code=")));
+    const local = links.find(url => url.startsWith("http://127.0.0.1:"));
+    const network = links.find(url => !url.startsWith("http://127.0.0.1:"));
+    const base = new URL(local).origin;
+
+    // Unpaired: pairing page only.
+    const stranger = await visit(base + "/");
+    scenario("Web access: an unpaired browser only sees the pairing page (#91)", stranger.tab.url().endsWith("/pair"), stranger.tab.url());
+    await stranger.context.close();
+
+    // Paired over this computer, then (if present) over the local network.
+    const paired = await visit(network ?? local);
+    const pairedOk = !paired.tab.url().includes("/pair") && paired.errors.length === 0;
+    scenario(
+      network ? "Web access: a browser paired over the local network loads the app with no page error (#91, #106)" : "Web access: a paired browser loads the app with no page error (#91)",
+      pairedOk,
+      `${paired.tab.url()} ${paired.errors.join(" | ")}`,
+    );
+    await paired.tab.screenshot({ path: process.env.TEMP + "\\playbook-04-web-paired.png" }).catch(() => {});
+
+    // Remove the device on the desktop: the browser is sent back to pairing.
+    dialog = settingsDialog();
+    await dialog.getByRole("button", { name: /^Remove / }).first().click();
+    await dialog.getByText("No device is paired yet.").waitFor({ timeout: 10_000 });
+    await paired.tab.reload();
+    await paired.tab.waitForTimeout(1_000);
+    scenario("Web access: a removed device is sent back to pairing (#91)", paired.tab.url().endsWith("/pair"), paired.tab.url());
+    await paired.context.close();
+
+    // Off: the port closes.
+    await choose(dialog, "Off");
+    await save(dialog);
+    await dialog.getByText("Browsers and other devices cannot connect.").waitFor({ timeout: 10_000 });
+    const closed = await fetch(base + "/pair").then(() => false, () => true);
+    scenario("Web access: turning it off closes the port (#91)", closed, base);
+    await page.keyboard.press("Escape");
+  } finally {
+    await visitor.close();
+  }
+}
+
 async function openSettingsTab(name) {
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await settingsDialog().getByRole("tab", { name }).click();
@@ -298,6 +384,8 @@ try {
   await replyLanguage.click();
   await page.getByRole("option", { name: previousReplyLanguage, exact: true }).click();
   await page.keyboard.press("Escape");
+
+  await webAccessScenario();
 } catch (error) {
   // The single-scenario mode ends the flow early on purpose; that is not a failure.
   if (!error?.done) {

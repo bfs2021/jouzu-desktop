@@ -25,6 +25,7 @@ import {
   type Unsubscribe,
   type WorkspaceApi,
 } from "./jouzu-api";
+import { newId } from "../secure-context";
 
 function unsupported(): never {
   throw new ApiError("invalid-request", "This action is not available in this version of Jouzu.", false);
@@ -126,7 +127,7 @@ function hostGroups(client: HostClient) {
 
   const commands: CommandApi = {
     async run(sessionId, command) {
-      await client.send(sessionId, command, `cmd-${crypto.randomUUID()}`);
+      await client.send(sessionId, command, `cmd-${newId()}`);
     },
     stats: sessionId => client.stats(sessionId),
     async compact(sessionId) {
@@ -164,6 +165,13 @@ function hostGroups(client: HostClient) {
       async save(entries) {
         await client.saveEnvironment(entries);
       },
+    },
+    webAccess: {
+      read: () => client.webAccess(),
+      update: scope => client.updateWebAccess(scope),
+      pair: () => client.startWebPairing(),
+      cancelPairing: () => client.cancelWebPairing(),
+      revoke: id => client.revokeWebDevice(id),
     },
     async control() {
       unsupported();

@@ -205,7 +205,20 @@ async fn main() -> ExitCode {
         control,
         events,
         models: std::sync::Arc::new(jouzu_host::models::Models::new(&home)),
+        web: std::sync::Arc::new(jouzu_host::web_access::WebAccess::load(&home)),
     };
+    // Web access listeners follow the saved scope; addresses can change (DHCP,
+    // Tailscale reconnect), so re-check them periodically.
+    jouzu_host::reconcile_web_access(&state).await;
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                jouzu_host::reconcile_web_access(&state).await;
+            }
+        });
+    }
     let app = router(state);
 
     let result = axum::serve(listener, app)

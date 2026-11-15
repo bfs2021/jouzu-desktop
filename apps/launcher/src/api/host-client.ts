@@ -22,6 +22,9 @@ import {
   type SessionSummary,
   type Workspace,
   type Unsubscribe,
+  type WebAccessMode,
+  type WebAccessPairing,
+  type WebAccessState,
 } from "./jouzu-api";
 
 export interface HostClientOptions {
@@ -255,6 +258,27 @@ export class HostClient {
   environment(): Promise<EnvironmentEntry[]> {
     return this.request<{ entries: EnvironmentEntry[] }>("/v1/environment")
       .then(body => body.entries);
+  }
+
+  webAccess(): Promise<WebAccessState> {
+    return this.request<WebAccessState>("/v1/web-access");
+  }
+
+  updateWebAccess(scope: { mode: WebAccessMode; networks: string[] }): Promise<WebAccessState> {
+    return this.request<WebAccessState>("/v1/web-access", { method: "PUT", body: JSON.stringify(scope) });
+  }
+
+  startWebPairing(): Promise<WebAccessPairing> {
+    return this.request<WebAccessPairing>("/v1/web-access/pairing", { method: "POST" });
+  }
+
+  async cancelWebPairing(): Promise<void> {
+    await this.request<unknown>("/v1/web-access/pairing", { method: "DELETE" });
+  }
+
+  revokeWebDevice(id?: string): Promise<WebAccessState> {
+    const path = id ? `/v1/web-access/devices/${encodeURIComponent(id)}` : "/v1/web-access/devices";
+    return this.request<WebAccessState>(path, { method: "DELETE" });
   }
 
   saveEnvironment(entries: EnvironmentEntry[]): Promise<EnvironmentEntry[]> {
