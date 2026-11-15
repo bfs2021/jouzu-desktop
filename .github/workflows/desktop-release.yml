@@ -71,6 +71,17 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Refuse a release without notes
+        if: ${{ inputs.publish }}
+        shell: bash
+        env:
+          INPUT_NOTES: ${{ inputs.notes }}
+        run: |
+          # The QA release and its feed entry describe what changed: the notes input, or the
+          # CHANGELOG section for this exact version. Checked before the build, not after it.
+          if [ -z "$INPUT_NOTES" ]; then
+            node packaging/launcher/launcher-notes.mjs CHANGELOG.md '${{ steps.check.outputs.version }}' > /dev/null
+          fi
       - name: Refuse a version that is not newer than both feeds
         if: ${{ inputs.publish }}
         shell: bash
@@ -241,10 +252,8 @@ jobs:
           asset="JouzuDesktop_${version}_x64-setup.exe"
           if [ -n "$INPUT_NOTES" ]; then
             printf '%s\n' "$INPUT_NOTES" > notes.md
-          elif node packaging/launcher/launcher-notes.mjs CHANGELOG.md "$version" > notes.md 2>/dev/null; then
-            :
           else
-            printf 'Jouzu Desktop %s\n' "$version" > notes.md
+            node packaging/launcher/launcher-notes.mjs CHANGELOG.md "$version" > notes.md
           fi
           node packaging/launcher/desktop-feed.mjs "$version" notes.md "$GITHUB_REPOSITORY" "$asset" "release/$asset.sig" latest.json
           cat latest.json
