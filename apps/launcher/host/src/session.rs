@@ -2,11 +2,11 @@
 //! bounded event log, and an exclusive lifecycle independent of any page.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -19,6 +19,84 @@ fn canonical_path(path: &str) -> String {
     path.strip_prefix("\\\\?\\").unwrap_or(path).to_string()
 }
 
+/// The folder a session file says it belongs to (its header's `cwd`), exactly as
+/// written. Pi compares folders as text (resolved and lower-cased, but `\\?\C:\x`
+/// and `C:\x` differ), and a runtime switched to a session whose folder differs
+/// from its own loads every extension again; so the runtime starts in this form.
+fn session_header(session_path: &str) -> Option<Value> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(session_path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(file).read_line(&mut line).ok()?;
+    let header: Value = serde_json::from_str(line.trim()).ok()?;
+    (header.get("type").and_then(Value::as_str) == Some("session")).then_some(header)
+}
+
+/// The conversation id a session file carries. A copied file keeps it, and the
+/// runtime lets only one attachment own a conversation at a time.
+fn session_header_id(session_path: &str) -> Option<String> {
+    session_header(session_path)?
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn session_header_cwd(session_path: &str) -> Option<String> {
+    let header = session_header(session_path)?;
+    let cwd = header.get("cwd").and_then(Value::as_str)?.to_string();
+    Path::new(&cwd).is_dir().then_some(cwd)
+}
+
+/// The model a saved session last used, the way the runtime restores it: the
+/// latest model change or assistant reply. (The runtime follows the current
+/// branch; file order is the same for a conversation without branches, and
+/// the runtime's own report replaces this once it is attached.)
+fn saved_model(path: &Path) -> Option<Value> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
+    let mut found = None;
+    for line in std::io::BufRead::lines(reader) {
+        let Ok(line) = line else { break };
+        let change = line.contains("\"model_change\"");
+        if !change && !line.contains("\"assistant\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let pair = if value["type"] == "model_change" {
+            (value["provider"].as_str(), value["modelId"].as_str())
+        } else if value["type"] == "message" && value["message"]["role"] == "assistant" {
+            (value["message"]["provider"].as_str(), value["message"]["model"].as_str())
+        } else {
+            continue;
+        };
+        if let (Some(provider), Some(id)) = pair {
+            found = Some(json!({ "provider": provider, "id": id, "name": id }));
+        }
+    }
+    found
+}
+
+/// The messages a saved session file holds, in the order they were written.
+fn saved_messages(path: &Path) -> std::io::Result<Vec<Value>> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
+    let mut messages = Vec::new();
+    for line in std::io::BufRead::lines(reader) {
+        let Ok(line) = line else { break };
+        let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("message") {
+            if let Some(message) = value.get_mut("message").map(Value::take) {
+                messages.push(message);
+            }
+        }
+    }
+    Ok(messages)
+}
+
 fn is_scratch_workspace(path: &str) -> bool {
     path.split(|character| character == '\\' || character == '/')
         .any(|part| part.starts_with("jouzu-warm-"))
@@ -29,7 +107,7 @@ use tokio::sync::broadcast;
 
 use crate::log;
 use crate::runtime::adapter::pi::{self, DeltaKind, Record as PiRecord};
-use crate::runtime::{RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec};
+use crate::runtime::{same_place, RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec, WarmPool};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct SessionPreference {
@@ -91,6 +169,49 @@ pub struct SessionConfig {
     pub bash: Option<PathBuf>,
     pub replay_limit: usize,
     pub events: Option<Arc<crate::events::EventHub>>,
+    /// The runtime started ahead of need, shared by every session.
+    pub warm: Arc<std::sync::OnceLock<Arc<WarmPool>>>,
+}
+
+impl SessionConfig {
+    /// The runtime's environment. Session-specific variables are left out for
+    /// a warm runtime, which does not belong to a session yet.
+    fn environment(
+        &self,
+        session_id: Option<&str>,
+        session_path: Option<&str>,
+    ) -> Vec<(OsString, OsString)> {
+        let mut environment: HashMap<String, (OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| {
+                let text = name.to_string_lossy();
+                !text.is_empty() && !text.contains('=') && !text.contains('\0')
+            })
+            .map(|(key, value)| (key.to_string_lossy().to_ascii_uppercase(), (key, value)))
+            .collect();
+        for name in ["NODE_OPTIONS", "NODE_PATH"] {
+            environment.remove(name);
+        }
+        let mut set = |name: &str, value: OsString| {
+            environment.insert(name.to_ascii_uppercase(), (OsString::from(name), value));
+        };
+        set("JOUZU_HOME", self.runtime_home.as_os_str().to_os_string());
+        set("JOUZU_NO_UPDATE", OsString::from("1"));
+        set("PI_SKIP_VERSION_CHECK", OsString::from("1"));
+        set("JOUZU_TEXTGUARD_DESKTOP", OsString::from("1"));
+        if let Some(id) = session_id {
+            set("JOUZU_HOST_SESSION_ID", OsString::from(id));
+        }
+        if let Some(bash) = &self.bash {
+            set("JOUZU_LAUNCHER_BASH", bash.as_os_str().to_os_string());
+        }
+        if let Some(path) = session_path {
+            set("JOUZU_SESSION_PATH", OsString::from(path));
+        }
+        for (key, value) in &self.spec.env {
+            set(key, OsString::from(value));
+        }
+        environment.into_values().collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -199,6 +320,84 @@ impl EventLog {
 
 const FLOW_RELEASE_ID: &str = "host-flow-release";
 
+/// A runtime message's content as host history blocks: words, reasoning and tool
+/// calls. Live replies and replies read back from a saved file use this one
+/// mapping, so a conversation has the same shape either way.
+fn reply_blocks(message: &Value) -> Vec<Value> {
+    let mut blocks = Vec::new();
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return blocks;
+    };
+    for block in content {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                }
+            }
+            Some("thinking") => {
+                if let Some(text) = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "thinking", "text": text }));
+                    }
+                }
+            }
+            Some("toolCall") => {
+                if let Some(id) = block
+                    .get("toolCallId")
+                    .or_else(|| block.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    blocks.push(json!({
+                        "type": "toolCall",
+                        "toolCallId": id,
+                        "name": block.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                        "input": block.get("arguments").or_else(|| block.get("input")).cloned().unwrap_or(Value::Null),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// What a tool that never finished shows: it was cut off, not still running.
+fn interrupted_result() -> Value {
+    json!({ "content": [{ "type": "text", "text": "Interrupted" }] })
+}
+
+/// Adds a result for every tool call in `blocks` that has none.
+fn close_unfinished_calls(blocks: &mut Vec<Value>) -> Vec<String> {
+    let finished: std::collections::HashSet<String> = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("toolResult"))
+        .filter_map(|block| block.get("toolCallId").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let open: Vec<String> = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("toolCall"))
+        .filter_map(|block| block.get("toolCallId").and_then(Value::as_str).map(str::to_string))
+        .filter(|id| !finished.contains(id))
+        .collect();
+    for id in &open {
+        blocks.push(json!({
+            "type": "toolResult",
+            "toolCallId": id,
+            "ok": false,
+            "interrupted": true,
+            "result": interrupted_result(),
+        }));
+    }
+    open
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handshake {
     Switch,
@@ -206,10 +405,87 @@ enum Handshake {
     Ready,
 }
 
+/// Where the running turn is: which step (one model call and the tools it asks
+/// for) and what that step is doing. The host works this out from the runtime's
+/// events in one place; clients show it as given.
+struct StepState {
+    n: u64,
+    state: &'static str,
+    since: String,
+    since_at: Instant,
+    started_at: Instant,
+    first_output: bool,
+    /// The history row of this step's finished reply, once the model is done
+    /// writing it; the step's tool calls and results are added to it.
+    row: Option<String>,
+    tools: Vec<(String, String, Instant)>,
+    retry: Option<Value>,
+}
+
+impl StepState {
+    fn new() -> Self {
+        Self {
+            n: 0,
+            state: "waiting_model",
+            since: Session::now_iso(),
+            since_at: Instant::now(),
+            started_at: Instant::now(),
+            first_output: false,
+            row: None,
+            tools: Vec::new(),
+            retry: None,
+        }
+    }
+}
+
+/// Time from a prompt reaching the runtime to its first output, over this
+/// host run. The runtime's own start is not in it.
+#[derive(Default)]
+struct FirstOutput {
+    sent: Option<Instant>,
+    count: u64,
+    total_ms: u64,
+    last_ms: Option<u64>,
+}
+
 struct SentMessage {
     message_id: String,
     text: String,
 }
+
+/// A message the user sent while a turn ran. The host keeps it until the
+/// runtime has used it: delivered into the running turn (steer), or started as
+/// the next turn. Nothing leaves this queue on a guess, so a message is never
+/// lost or sent twice across reconnects, Stop, or a runtime restart.
+struct Queued {
+    turn: String,
+    prompt: Value,
+    /// The user's row, written to history when the runtime uses the message.
+    /// A retried turn already has its row.
+    row: Option<Value>,
+    /// Handed to the runtime as `steer` (the clear generation it belongs to)
+    /// and not yet delivered.
+    steered: Option<u64>,
+    /// The runtime would not take it as steer; it runs as its own turn.
+    no_steer: bool,
+    /// An extension (Flow) took the steer and holds it; it releases it into the
+    /// runtime's queue later. Still the user's, still not delivered: never sent
+    /// again by the host while held.
+    held: bool,
+}
+
+impl Queued {
+    fn client_message_id(&self) -> Option<&str> {
+        self.prompt.get("id").and_then(Value::as_str)
+    }
+
+    fn text(&self) -> &str {
+        self.prompt.get("message").and_then(Value::as_str).unwrap_or("")
+    }
+}
+
+const STEER_ID_PREFIX: &str = "steer:";
+const CLEAR_QUEUE_ID_PREFIX: &str = "clear-queue:";
 
 struct PendingApproval {
     pi_id: String,
@@ -233,12 +509,34 @@ pub struct Session {
     tx: broadcast::Sender<SessionEvent>,
     runtime: Mutex<Option<Arc<RuntimeSupervisor>>>,
     runtime_generation: AtomicU64,
-    recovery_attempts: Mutex<Vec<Instant>>,
-    recovery_scheduled: AtomicBool,
+    restarts: crate::runtime::restart::RestartBudget,
     config: SessionConfig,
     lease_path: PathBuf,
     messages: Mutex<HashMap<String, SentMessage>>,
-    queued_turns: Mutex<VecDeque<(String, Value)>>,
+    queued_turns: Mutex<VecDeque<Queued>>,
+    /// Steered messages up to this generation are being taken back (`clear_queue`).
+    steer_generation: AtomicU64,
+    /// This run's first model call has started (its first reply began). The
+    /// runtime takes waiting steers once more just before that call, so a
+    /// steer handed over earlier would be merged into the first message.
+    replying: AtomicBool,
+    /// Steers written to the runtime and not answered yet. The runtime queues
+    /// a steer only after its extensions' input handlers ran, handling other
+    /// commands meanwhile: until it answers, a take-back would miss it.
+    steers_in_flight: AtomicUsize,
+    /// A take-back is due once every steer in flight has been answered.
+    reclaim_waiting: AtomicBool,
+    /// Created as a new conversation, not opened from a saved file. Only a new
+    /// one starts on the default model; a saved one keeps the model it used,
+    /// which the runtime restores when it opens the file.
+    fresh: AtomicBool,
+    /// The running turn's own prompt has not come back from the runtime yet;
+    /// the first user message of a run is that prompt, not a steered one.
+    prompt_echo: AtomicBool,
+    first_output_turn: Mutex<Option<String>>,
+    first_output: Mutex<FirstOutput>,
+    /// Held while this session attaches to a runtime from the warm pool.
+    warm_attach: Mutex<Option<(crate::runtime::warm::Attaching, Instant)>>,
     queue_paused: AtomicBool,
     pending_prompts: Mutex<Vec<Value>>,
     next_message: AtomicU64,
@@ -252,6 +550,10 @@ pub struct Session {
     /// withholds it (and any new input) until someone decides; the host already
     /// decided (the turn failed), so recovery releases the hold before going idle.
     release_flow_hold: AtomicBool,
+    /// Slash commands written to the runtime and not yet answered, oldest first.
+    /// A command's replies are notices the runtime emits before it answers, so a
+    /// notice published while one is open is tagged with it (see `notice_origin`).
+    commands: Mutex<Vec<(String, String)>>,
     cancelled: Mutex<HashMap<String, Instant>>,
     failed_turn: Mutex<Option<Value>>,
     listed: Mutex<bool>,
@@ -261,6 +563,10 @@ pub struct Session {
     ready: tokio::sync::Notify,
     pending_approvals: Mutex<HashMap<String, PendingApproval>>,
     pending_questions: Mutex<HashMap<String, PendingQuestion>>,
+    /// Extension status lines (`setStatus`), keyed by the extension's status key.
+    ui_statuses: Mutex<BTreeMap<String, String>>,
+    /// Extension widgets (`setWidget`), keyed by the extension's widget key.
+    ui_widgets: Mutex<BTreeMap<String, Vec<String>>>,
     approval_outcomes: Mutex<HashMap<String, String>>,
     question_outcomes: Mutex<HashMap<String, String>>,
     next_prompt: AtomicU64,
@@ -270,10 +576,16 @@ pub struct Session {
     history_seq: AtomicU64,
     assistant_text: Mutex<String>,
     assistant_blocks: Mutex<Vec<Value>>,
+    step: Mutex<StepState>,
     active_client: Mutex<Option<String>>,
     model: Mutex<Option<Value>>,
     pending_model: Mutex<Option<Value>>,
+    /// The request that applies a model chosen before the runtime started; its
+    /// failure is reported to the user, since nobody is waiting on it.
+    pending_model_request: Mutex<Option<(String, Value)>>,
     pending_thinking: Mutex<Option<String>>,
+    /// The reasoning level the runtime reports (or the one chosen and not yet applied).
+    thinking_level: Mutex<Option<String>>,
     subscribers: AtomicU64,
     next_client: AtomicU64,
     last_activity: Mutex<Instant>,
@@ -285,6 +597,27 @@ impl Session {
             .status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A runtime is up and answering. Starting, recovering or never started
+    /// sessions have none, and questions about the runtime have no answer yet.
+    pub fn has_runtime(&self) -> bool {
+        !matches!(
+            self.status(),
+            Status::Pending | Status::Starting | Status::Recovering | Status::Stopped | Status::Error
+        ) && self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// The session's own saved file, once the runtime has written one.
+    pub fn saved_path(&self) -> Option<String> {
+        self.session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn cursor(&self) -> u64 {
@@ -363,9 +696,9 @@ impl Session {
             None
         };
         let mut page = page;
-        // A resync while a turn is streaming must include what the assistant has
-        // already said. This row is synthetic: it is not appended to history until
-        // turn.end.
+        // A resync while a step is streaming must include what it has already
+        // said. This row is synthetic: the step's reply is appended to history
+        // when the runtime finishes writing it.
         let active = self
             .active_message
             .lock()
@@ -383,10 +716,12 @@ impl Session {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             if !text.is_empty() || !blocks.is_empty() {
+                let n = self.step_guard().n.max(1);
                 let mut row = json!({
                     "kind": "assistant",
-                    "id": format!("{turn}:assistant"),
+                    "id": format!("{turn}:assistant:{n}"),
                     "turnId": turn,
+                    "step": n,
                     "text": text,
                     "blocks": if blocks.is_empty() { json!([{ "type": "text", "text": text }]) } else { json!(blocks) },
                     "createdAt": Self::now_iso(),
@@ -405,12 +740,7 @@ impl Session {
                         .cloned()
                         .unwrap_or(Value::Null);
                 }
-                // Follow-ups queued behind this turn are newer than its reply.
-                let at = page
-                    .iter()
-                    .take_while(|row| row.get("queued").and_then(Value::as_bool) == Some(true))
-                    .count();
-                page.insert(at, row);
+                page.insert(0, row);
             }
         }
         json!({ "messages": page, "nextBefore": next_before })
@@ -427,28 +757,282 @@ impl Session {
             .push(row);
     }
 
-    /// A queued follow-up is recorded when it is accepted, while the previous
-    /// turn is still running. When it starts, move its user row after that turn's
-    /// reply so history reads in the order the conversation happened.
-    fn place_started_row(&self, turn: &str) {
-        let id = format!("{turn}:user");
-        let mut history = self
+    /// A queued message the runtime has used: its row joins history now, where
+    /// it happened in the conversation, and every client is told.
+    fn deliver_user_row(&self, mut row: Value, turn: &str) {
+        if let Some(object) = row.as_object_mut() {
+            object.insert("turnId".to_string(), json!(turn));
+            object.insert("createdAt".to_string(), json!(Self::now_iso()));
+        }
+        self.push_history(row.clone());
+        let row = self
             .history
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(at) = history
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last()
+            .cloned()
+            .unwrap_or(row);
+        self.publish("message.user", row);
+    }
+
+    /// Hand every waiting message to the running turn. The runtime delivers
+    /// each one at its next step boundary, before the next model call. Not
+    /// before the run's first reply has started: the runtime would put it in
+    /// the first request beside the message that started the run.
+    fn steer_queue(&self) {
+        if !self.replying.load(Ordering::SeqCst)
+            || self.queue_paused.load(Ordering::SeqCst)
+            || self.cancelling.load(Ordering::SeqCst)
+            || self.active_turn().is_none()
+            || !matches!(
+                self.status(),
+                Status::Running | Status::WaitingApproval | Status::WaitingQuestion
+            )
+        {
+            return;
+        }
+        let generation = self.steer_generation.load(Ordering::SeqCst);
+        let commands: Vec<Value> = {
+            let mut queue = self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue
+                .iter_mut()
+                .filter(|item| item.steered.is_none() && !item.no_steer && !item.held)
+                .map(|item| {
+                    item.steered = Some(generation);
+                    pi::command::with_id(
+                        pi::command::as_steer(&item.prompt),
+                        &format!("{STEER_ID_PREFIX}{}", item.client_message_id().unwrap_or_default()),
+                    )
+                })
+                .collect()
+        };
+        for command in commands {
+            log(
+                &self.home,
+                "info",
+                "queue.steer_sent",
+                json!({ "session": self.id, "clientMessageId": command.get("id").and_then(Value::as_str).and_then(|id| id.strip_prefix(STEER_ID_PREFIX)) }),
+            );
+            self.steers_in_flight.fetch_add(1, Ordering::SeqCst);
+            if self.write_command(command).is_err() {
+                self.steers_in_flight.fetch_sub(1, Ordering::SeqCst);
+                break;
+            }
+        }
+    }
+
+    /// Take back steered messages the runtime has not delivered (a turn ended,
+    /// Stop, or one was removed). They stay queued here; the runtime's answer
+    /// says the take-back is done.
+    ///
+    /// Returns whether a take-back is under way: the next queued turn then
+    /// starts from its answer, never beside it, or the runtime could use a
+    /// message both as that turn's prompt and as a steer it still holds.
+    fn reclaim_steered(&self) -> bool {
+        let any = self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .position(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            .any(|item| item.steered.is_some());
+        if !any {
+            return false;
+        }
+        if self.steers_in_flight.load(Ordering::SeqCst) > 0 {
+            // A steer still on its way would land after an empty take-back.
+            // Take back once the runtime has answered them all.
+            self.reclaim_waiting.store(true, Ordering::SeqCst);
+        } else {
+            self.clear_runtime_queue();
+        }
+        true
+    }
+
+    /// A run ended: take back what it did not use, then start the next
+    /// waiting message (at once, or from the take-back's answer).
+    fn run_finished(self: &Arc<Self>) {
+        if self.reclaim_steered() || !self.start_queued_turn() {
+            self.set_status(Status::Idle);
+        }
+    }
+
+    fn clear_runtime_queue(&self) {
+        let generation = self.steer_generation.fetch_add(1, Ordering::SeqCst);
+        log(&self.home, "info", "queue.take_back", json!({ "session": self.id, "generation": generation }));
+        let _ = self.write_command(pi::command::with_id(
+            pi::command::clear_queue(),
+            &format!("{CLEAR_QUEUE_ID_PREFIX}{generation}"),
+        ));
+    }
+
+    /// A held message released into the runtime's queue after its run ended
+    /// waits there with nothing to run it: take it back, and it runs as the next turn.
+    fn runtime_queue_changed(self: &Arc<Self>, value: &Value) {
+        let waiting = value
+            .get("steering")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        let held = self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|item| item.held);
+        if waiting && held && self.active_turn().is_none() {
+            self.clear_runtime_queue();
+        }
+    }
+
+    /// A user message the runtime put into the running turn.
+    fn user_message_started(&self, message: Option<&Value>) {
+        let Some(turn) = self.active_turn() else { return };
+        if self.prompt_echo.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let text = message
+            .and_then(|message| message.get("content"))
+            .map(pi::content_text)
+            .unwrap_or_default();
+        let delivered = {
+            let mut queue = self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The runtime delivers what it was given; a slash command arrives expanded.
+            let at = queue
+                .iter()
+                .position(|item| (item.steered.is_some() || item.held) && item.text() == text)
+                .or_else(|| {
+                    queue
+                        .iter()
+                        .position(|item| item.steered.is_some() && item.text().starts_with('/'))
+                });
+            at.and_then(|at| queue.remove(at))
+        };
+        let row = match delivered {
+            Some(item) => item.row,
+            None if text.is_empty() => None,
+            // Not one of ours (taken back too late, or added by an extension):
+            // the transcript has it, so history shows it.
+            None => {
+                let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
+                Some(json!({
+                    "kind": "user",
+                    "id": format!("m-{counter}:user"),
+                    "text": text,
+                    "blocks": [{ "type": "text", "text": text }],
+                }))
+            }
+        };
+        if let Some(row) = row {
+            self.deliver_user_row(row, &turn);
+        }
+        self.publish_summary();
+    }
+
+    /// The runtime answered a steer or a take-back.
+    fn queue_response(self: &Arc<Self>, id: &str, value: &Value) {
+        if let Some(client) = id.strip_prefix(STEER_ID_PREFIX) {
+            let _ = self.steers_in_flight.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            if self.steers_in_flight.load(Ordering::SeqCst) == 0
+                && self.reclaim_waiting.swap(false, Ordering::SeqCst)
+            {
+                // Its run ended while it was on its way: now the take-back sees it.
+                self.clear_runtime_queue();
+            }
+            let success = value.get("success").and_then(Value::as_bool) == Some(true);
+            let handled = value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled");
+            if success && !handled {
+                return;
+            }
+            let item = {
+                let mut queue = self
+                    .queued_turns
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(at) = queue
+                    .iter()
+                    .position(|item| item.client_message_id() == Some(client))
+                else {
+                    return;
+                };
+                if handled && queue[at].text().starts_with('/') {
+                    // An extension command answered in place: it is done.
+                    queue.remove(at)
+                } else if handled {
+                    // Taken but not delivered (Flow holds it until its gate opens). It
+                    // stays the user's waiting message until the runtime starts it.
+                    log(
+                        &self.home,
+                        "info",
+                        "queue.steer_held",
+                        json!({ "session": self.id, "clientMessageId": client }),
+                    );
+                    queue[at].steered = None;
+                    queue[at].held = true;
+                    None
+                } else {
+                    // Refused as steer (an extension command): it runs as its own
+                    // turn after this one, where the runtime can answer it properly.
+                    log(
+                        &self.home,
+                        "info",
+                        "queue.steer_refused",
+                        json!({ "session": self.id, "error": value.get("error") }),
+                    );
+                    queue[at].steered = None;
+                    queue[at].no_steer = true;
+                    None
+                }
+            };
+            // A command the runtime ran in place: the user's row all the same.
+            if let (Some(item), Some(turn)) = (item, self.active_turn()) {
+                if let Some(row) = item.row {
+                    self.deliver_user_row(row, &turn);
+                }
+            }
+            self.publish_summary();
+            return;
+        }
+        let Some(generation) = id
+            .strip_prefix(CLEAR_QUEUE_ID_PREFIX)
+            .and_then(|generation| generation.parse::<u64>().ok())
         else {
             return;
         };
-        let mut row = history.remove(at);
-        let cursor = self.history_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(object) = row.as_object_mut() {
-            object.remove("queued");
-            object.insert("cursor".to_string(), json!(cursor));
+        // Everything steered up to this take-back that was not delivered before
+        // it (deliveries arrive first) is back in our hands. So is a held message
+        // its extension had released into the runtime's queue: the answer lists it.
+        let mut released: Vec<String> = value
+            .pointer("/data/steering")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        for item in self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter_mut()
+        {
+            if item.steered.is_some_and(|steered| steered <= generation) {
+                item.steered = None;
+            }
+            if item.held {
+                if let Some(at) = released.iter().position(|text| *text == item.text()) {
+                    released.remove(at);
+                    item.held = false;
+                }
+            }
         }
-        history.push(row);
+        if self.active_turn().is_some() {
+            self.steer_queue();
+        } else if self.status() == Status::Idle {
+            self.start_queued_turn();
+        }
+        self.publish_summary();
     }
 
     fn now_iso() -> String {
@@ -498,41 +1082,301 @@ impl Session {
         blocks.push(json!({ "type": kind, "text": text }));
     }
 
-    fn push_assistant_tool_call(&self, call_id: &str, name: &str, input: Value) {
-        self.assistant_blocks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(json!({
-                "type": "toolCall",
-                "toolCallId": call_id,
-                "name": name,
-                "input": input,
-            }));
+    fn step_guard(&self) -> std::sync::MutexGuard<'_, StepState> {
+        self.step.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn push_assistant_tool_result(&self, call_id: &str, ok: bool, result: Value) {
-        self.assistant_blocks
+    fn active_turn_id(&self) -> Option<String> {
+        self.active_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(json!({
-                "type": "toolResult",
-                "toolCallId": call_id,
-                "ok": ok,
-                "result": result,
-            }));
+            .clone()
     }
 
-    fn take_assistant_blocks(&self, text: &str) -> Value {
-        let mut blocks = std::mem::take(
+    /// The turn in progress, as clients show it: which step and what it is doing.
+    fn step_view(&self) -> Value {
+        let step = self.step_guard();
+        json!({
+            "n": step.n,
+            "state": step.state,
+            "since": step.since,
+            "tools": step.tools.iter().map(|(id, name, _)| json!({ "id": id, "name": name })).collect::<Vec<_>>(),
+            "retry": step.retry,
+        })
+    }
+
+    fn reset_step(&self) {
+        *self.step_guard() = StepState::new();
+    }
+
+    fn set_step_state(&self, state: &'static str) {
+        let changed = {
+            let mut step = self.step_guard();
+            if step.state == state {
+                false
+            } else {
+                step.state = state;
+                step.since = Self::now_iso();
+                step.since_at = Instant::now();
+                true
+            }
+        };
+        if changed {
+            self.publish_summary();
+        }
+    }
+
+    fn log_step(&self, mark: &str, fields: Value) {
+        let mut data = json!({
+            "session": self.id,
+            "mark": mark,
+            "turnId": self.active_turn_id(),
+            "clientMessageId": self
+                .active_client_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        });
+        if let (Some(data), Some(fields)) = (data.as_object_mut(), fields.as_object()) {
+            for (key, value) in fields {
+                data.insert(key.clone(), value.clone());
+            }
+        }
+        log(&self.home, "info", "timing", data);
+    }
+
+    /// A new step: the runtime is asking the model again. Whatever the previous
+    /// step left unwritten is kept as its reply first.
+    fn begin_step(&self) {
+        let Some(turn) = self.active_turn_id() else {
+            return;
+        };
+        self.finish_step_reply(&turn, None, false);
+        let n = {
+            let mut step = self.step_guard();
+            step.n += 1;
+            step.state = "waiting_model";
+            step.since = Self::now_iso();
+            step.since_at = Instant::now();
+            step.started_at = Instant::now();
+            step.first_output = false;
+            step.row = None;
+            step.tools.clear();
+            step.retry = None;
+            step.n
+        };
+        self.log_step("step.start", json!({ "step": n }));
+        self.publish(
+            "message.start",
+            json!({ "messageId": turn, "turnId": turn, "step": n, "role": "assistant" }),
+        );
+        self.publish_summary();
+    }
+
+    /// Output that arrives with no step begun (a runtime that does not mark
+    /// steps) starts the first one.
+    fn ensure_step(&self) {
+        if self.step_guard().n == 0 {
+            self.begin_step();
+        }
+    }
+
+    /// The step shows something: its first output is timed against the moment it
+    /// asked the model.
+    fn step_output(&self, state: &'static str) {
+        let first = {
+            let mut step = self.step_guard();
+            if step.first_output {
+                None
+            } else {
+                step.first_output = true;
+                Some((step.n, step.started_at.elapsed().as_millis() as u64))
+            }
+        };
+        if let Some((n, wait)) = first {
+            self.log_step("step.first_output", json!({ "step": n, "waitMs": wait }));
+        }
+        self.set_step_state(state);
+    }
+
+    /// The step's reply is complete (or cut off): it becomes a history row of its
+    /// own. `message` is the runtime's own record of the reply when it has one.
+    fn finish_step_reply(&self, turn: &str, message: Option<&Value>, interrupted: bool) {
+        let text = std::mem::take(
+            &mut *self
+                .assistant_text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let streamed = std::mem::take(
             &mut *self
                 .assistant_blocks
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
+        let mut blocks = message.map(reply_blocks).unwrap_or_default();
+        if blocks.is_empty() {
+            blocks = streamed;
+        } else {
+            // Calls and results the runtime reported apart from the reply.
+            for block in streamed {
+                let kind = block.get("type").and_then(Value::as_str);
+                let id = block.get("toolCallId").and_then(Value::as_str);
+                let known = blocks.iter().any(|known| {
+                    known.get("type").and_then(Value::as_str) == kind
+                        && known.get("toolCallId").and_then(Value::as_str) == id
+                });
+                if matches!(kind, Some("toolCall" | "toolResult")) && !known {
+                    blocks.push(block);
+                }
+            }
+        }
         if blocks.is_empty() && !text.is_empty() {
             blocks.push(json!({ "type": "text", "text": text }));
         }
-        Value::Array(blocks)
+        // A reply with nothing in it is still a reply when it carries an error.
+        let failed = message
+            .and_then(|message| message.get("errorMessage"))
+            .is_some_and(|error| !error.is_null());
+        if blocks.is_empty() && !failed {
+            return;
+        }
+        let n = self.step_guard().n.max(1);
+        let id = format!("{turn}:assistant:{n}");
+        let words = blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("");
+        let stop_reason = message
+            .and_then(|message| message.get("stopReason"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| if interrupted { "aborted" } else { "stop" }.to_string());
+        let mut row = json!({
+            "kind": "assistant",
+            "id": id,
+            "turnId": turn,
+            "step": n,
+            "text": words,
+            "blocks": blocks,
+            "stopReason": stop_reason,
+            "createdAt": Self::now_iso(),
+        });
+        if interrupted {
+            row["interrupted"] = json!(true);
+        }
+        if let Some(message) = message {
+            for field in ["model", "provider", "usage", "errorMessage"] {
+                if let Some(value) = message.get(field).filter(|value| !value.is_null()) {
+                    row[field] = value.clone();
+                }
+            }
+        }
+        if row.get("model").map(Value::is_null).unwrap_or(true) {
+            if let Some(model) = self
+                .model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                row["model"] = model
+                    .get("name")
+                    .or_else(|| model.get("id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if let Some(provider) = model.get("provider") {
+                    row["provider"] = provider.clone();
+                }
+            }
+        }
+        self.push_history(row.clone());
+        self.step_guard().row = Some(id);
+        self.publish(
+            "message.done",
+            json!({
+                "messageId": turn,
+                "step": n,
+                "stopReason": stop_reason,
+                "blocks": row.get("blocks").cloned().unwrap_or_else(|| json!([])),
+                "model": row.get("model").cloned().unwrap_or(Value::Null),
+                "provider": row.get("provider").cloned().unwrap_or(Value::Null),
+                "usage": row.get("usage").cloned().unwrap_or(Value::Null),
+                "errorMessage": row.get("errorMessage").cloned().unwrap_or(Value::Null),
+            }),
+        );
+    }
+
+    /// A tool call or result belongs to the step's reply: in the history row once
+    /// the reply is written, otherwise with what is still streaming.
+    fn add_to_step_reply(&self, block: Value) {
+        let row = self.step_guard().row.clone();
+        if let Some(row) = row {
+            let mut history = self
+                .history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(blocks) = history
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(row.as_str()))
+                .and_then(|entry| entry.get_mut("blocks"))
+                .and_then(Value::as_array_mut)
+            {
+                let kind = block.get("type").and_then(Value::as_str);
+                let id = block.get("toolCallId").and_then(Value::as_str);
+                let known = blocks.iter().any(|known| {
+                    known.get("type").and_then(Value::as_str) == kind
+                        && known.get("toolCallId").and_then(Value::as_str) == id
+                });
+                if !known {
+                    blocks.push(block);
+                }
+                return;
+            }
+        }
+        self.assistant_blocks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(block);
+    }
+
+    /// When a turn ends, no tool of it is still at work: any without a result
+    /// was cut off, and says so, live and in history.
+    fn close_unfinished_tools(&self) {
+        let mut closed = Vec::new();
+        {
+            let mut history = self
+                .history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for entry in history.iter_mut() {
+                match entry.get("kind").and_then(Value::as_str) {
+                    Some("tool") if entry["tool"]["status"] == "running" => {
+                        entry["tool"]["status"] = json!("interrupted");
+                        entry["result"] = interrupted_result();
+                        if let Some(id) = entry["tool"]["callId"].as_str() {
+                            closed.push(id.to_string());
+                        }
+                    }
+                    Some("assistant") => {
+                        if let Some(blocks) = entry.get_mut("blocks").and_then(Value::as_array_mut) {
+                            closed.extend(close_unfinished_calls(blocks));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        closed.sort();
+        closed.dedup();
+        for id in closed {
+            self.publish(
+                "tool.result",
+                json!({ "toolCallId": id, "ok": false, "interrupted": true, "result": interrupted_result() }),
+            );
+        }
     }
 
     fn update_history_tool(&self, call_id: &str, status: &str, result: Value) {
@@ -554,26 +1398,33 @@ impl Session {
         self.tx.subscribe()
     }
 
+    /// Everything a client needs to show the session from scratch: the same
+    /// fields as `session.updated` (queue, failed message, turn, prompts), plus
+    /// where the stream resumes. One builder, so the two cannot drift apart.
     pub fn snapshot_event(&self) -> SessionEvent {
         let cursor = self.cursor();
+        let mut data = self.summary();
+        data["cursor"] = json!(cursor);
+        data["workspacePath"] = json!(canonical_path(&self.workspace_path));
         SessionEvent {
             id: cursor,
             event: "session.snapshot".to_string(),
-            data: json!({
-                "sessionId": self.id,
-                "status": self.status().as_str(),
-                "activeTurn": self.active_turn(),
-                "cursor": cursor,
-                "workspacePath": canonical_path(&self.workspace_path),
-                "sessionPath": self
-                    .session_path
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-                "pendingApprovals": self.pending_approvals(),
-                "pendingQuestions": self.pending_questions(),
-            }),
+            data,
         }
+    }
+
+    fn ui_statuses(&self) -> Value {
+        json!(*self
+            .ui_statuses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    fn ui_widgets(&self) -> Value {
+        json!(*self
+            .ui_widgets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
     pub fn events_after(&self, after: u64) -> (Vec<SessionEvent>, u64) {
@@ -597,8 +1448,103 @@ impl Session {
         (events, cursor)
     }
 
+    /// One `timing` line in host.log for each moment a user would notice: accepted,
+    /// started, first output, done, and status changes. The same lines are written
+    /// in every build, so a report from any installation can be timed afterwards.
+    /// Content is never logged, only the event and its ids.
+    fn record_timing(&self, event: &str, data: &Value) {
+        // The prompt reaches the runtime when the turn runs: at its start, or when a
+        // turn that waited for the runtime starts running.
+        let running = (event == "turn.start" && data.get("phase").and_then(Value::as_str) == Some("running"))
+            || (event == "session.status" && data.get("status").and_then(Value::as_str) == Some("running"));
+        if running {
+            let mut first = self
+                .first_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if first.sent.is_none() {
+                first.sent = Some(Instant::now());
+            }
+        }
+        if event == "turn.end" {
+            self.first_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .sent = None;
+        }
+        let mark = match event {
+            "message.accepted" | "turn.start" | "message.done" | "turn.end" | "session.status" => event,
+            // The first thing the reply shows: words, thinking, or a tool at work.
+            "message.delta" | "tool.start" => {
+                let id = data
+                    .get("messageId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        self.active_message
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone()
+                    })
+                    .unwrap_or_default();
+                let id = id.as_str();
+                let mut last = self
+                    .first_output_turn
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if last.as_deref() == Some(id) {
+                    return;
+                }
+                *last = Some(id.to_string());
+                let mut first = self
+                    .first_output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(sent) = first.sent.take() {
+                    let ms = sent.elapsed().as_millis() as u64;
+                    first.count += 1;
+                    first.total_ms += ms;
+                    first.last_ms = Some(ms);
+                }
+                "message.first_output"
+            }
+            _ => return,
+        };
+        let turn = data
+            .get("turnId")
+            .or_else(|| data.get("messageId"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        // An event about one message (a waiting one is accepted while another runs) names
+        // that message; otherwise the mark belongs to the running turn's message.
+        let client_message = data
+            .get("clientMessageId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                self.active_client_message
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            });
+        log(
+            &self.home,
+            "info",
+            "timing",
+            json!({
+                "session": self.id,
+                "mark": mark,
+                "turnId": turn,
+                "clientMessageId": client_message,
+                "status": data.get("status").cloned().unwrap_or(Value::Null),
+                "phase": data.get("phase").cloned().unwrap_or(Value::Null),
+            }),
+        );
+    }
+
     fn publish(&self, event: &str, data: Value) -> SessionEvent {
         self.touch();
+        self.record_timing(event, &data);
         let stored = {
             let mut log_guard = self
                 .events
@@ -632,6 +1578,22 @@ impl Session {
                 true
             }
         };
+        if changed && !matches!(status, Status::Pending | Status::Starting | Status::Recovering) {
+            // Attached (or given up): the pool may start the next runtime.
+            let attach = self
+                .warm_attach
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some((_attaching, since)) = attach {
+                log(
+                    &self.home,
+                    "info",
+                    "runtime.warm_attached",
+                    json!({ "session": self.id, "status": status.as_str(), "elapsedMs": since.elapsed().as_millis() as u64 }),
+                );
+            }
+        }
         if changed {
             if matches!(status, Status::Running) {
                 self.turn_running.store(true, Ordering::SeqCst);
@@ -658,6 +1620,16 @@ impl Session {
     }
 
     fn write_command(&self, value: Value) -> Result<(), ApiError> {
+        let command = matches!(value.get("type").and_then(Value::as_str), Some("prompt" | "steer"))
+            .then(|| (value.get("id").and_then(Value::as_str), value.get("message").and_then(Value::as_str)))
+            .and_then(|(id, text)| Some((id?.to_string(), text?.trim().to_string())))
+            .filter(|(_, text)| text.starts_with('/'));
+        if let Some(command) = command.clone() {
+            self.commands
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(command);
+        }
         let runtime = self
             .runtime
             .lock()
@@ -672,6 +1644,9 @@ impl Session {
                 )
             })?;
         runtime.enqueue(value).map_err(|message| {
+            if let Some((id, _)) = &command {
+                self.command_answered(id);
+            }
             ApiError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "runtime-unavailable",
@@ -683,7 +1658,7 @@ impl Session {
 
     fn request_messages(&self) {
         let id = self.request_id();
-        if let Err(error) = self.write_command(json!({ "id": id, "type": "get_messages" })) {
+        if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_messages(), &id)) {
             self.publish(
                 "error",
                 json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
@@ -694,7 +1669,7 @@ impl Session {
 
     fn request_state(&self) {
         let id = self.request_id();
-        if let Err(error) = self.write_command(json!({ "id": id, "type": "get_state" })) {
+        if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_state(), &id)) {
             self.publish(
                 "error",
                 json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
@@ -711,12 +1686,20 @@ impl Session {
             .clone();
         match existing {
             Some(path) => {
+                // How much history the runtime loads: a long session takes long to attach.
+                log(
+                    &self.home,
+                    "info",
+                    "session.attach",
+                    json!({
+                        "session": self.id,
+                        "bytes": std::fs::metadata(&path).map(|meta| meta.len()).ok(),
+                        "status": self.status().as_str(),
+                    }),
+                );
                 let id = self.request_id();
-                let result = self.write_command(json!({
-                    "id": id,
-                    "type": "switch_session",
-                    "sessionPath": path,
-                }));
+                let result =
+                    self.write_command(pi::command::with_id(pi::command::switch_session(&path), &id));
                 if let Err(error) = result {
                     self.publish(
                         "error",
@@ -741,9 +1724,36 @@ impl Session {
         }
     }
 
+    /// The slash command open while a notice arrived: the newest one. The
+    /// runtime runs a command's handler to the end before it answers, so every
+    /// reply of a command carries it, and its last reply comes last. Notices the
+    /// runtime raises on its own (a recovery announcement) can land in the same
+    /// window; they carry it too, which is why only the last reply settles state.
+    fn notice_origin(&self) -> Option<Value> {
+        let commands = self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        commands.last().map(|(id, text)| {
+            json!({ "id": id, "text": text, "origin": if id == FLOW_RELEASE_ID { "host" } else { "user" } })
+        })
+    }
+
+    /// A slash command was answered: every reply it had is published. Tell
+    /// clients, so state its replies settle (a Flow hold) can be settled.
+    fn command_answered(&self, id: &str) -> Option<Value> {
+        let done = {
+            let mut commands = self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let at = commands.iter().position(|(open, _)| open == id)?;
+            commands.remove(at)
+        };
+        Some(json!({ "id": done.0, "text": done.1, "origin": if done.0 == FLOW_RELEASE_ID { "host" } else { "user" } }))
+    }
+
     fn handle_response(self: &Arc<Self>, value: &Value) {
         let command = value.get("command").and_then(Value::as_str).unwrap_or("");
         let response_id = value.get("id").and_then(Value::as_str).unwrap_or("");
+        if let Some(mut done) = self.command_answered(response_id) {
+            done["success"] = value.get("success").cloned().unwrap_or(Value::Null);
+            self.publish("session.command_done", done);
+        }
         if response_id == FLOW_RELEASE_ID {
             log(
                 &self.home,
@@ -756,16 +1766,32 @@ impl Session {
             }
             return;
         }
-        if command == "prompt"
+        if response_id.starts_with(STEER_ID_PREFIX) || response_id.starts_with(CLEAR_QUEUE_ID_PREFIX) {
+            self.queue_response(response_id, value);
+            return;
+        }
+        let reply = pi::reply_to(value);
+        if reply == pi::Reply::Prompt
             && value.get("success").and_then(Value::as_bool) == Some(true)
             && value.pointer("/data/disposition").and_then(Value::as_str) == Some("handled")
         {
             self.end_turn_without_run(response_id);
             return;
         }
-        if command == "get_state" {
+        // A state answer that arrives while the runtime is switching to this
+        // session's file describes the runtime before the switch: a warm runtime
+        // reports its own blank file. Only answers after the switch are this session's.
+        let switching = matches!(
+            *self
+                .handshake
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Handshake::Switch
+        );
+        if reply == pi::Reply::GetState && !switching {
             if let Some(data) = value.get("data") {
-                if let Some(path) = data.get("sessionFile").and_then(Value::as_str) {
+                let state = pi::State::read(data);
+                if let Some(path) = state.session_file.as_deref() {
                     *self
                         .session_path
                         .lock()
@@ -785,11 +1811,22 @@ impl Session {
                         }),
                     );
                 }
-                if let Some(model) = data.get("model") {
-                    *self
-                        .model
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(model.clone());
+                // A choice made before the runtime started wins until it is applied.
+                let choice_waiting = self
+                    .pending_model
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some();
+                if let (Some(model), false) = (state.model.clone(), choice_waiting) {
+                    self.set_model(Some(model));
+                }
+                let level_waiting = self
+                    .pending_thinking
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some();
+                if let (Some(level), false) = (state.thinking_level.clone(), level_waiting) {
+                    self.set_thinking_level(Some(level));
                 }
             }
         }
@@ -797,6 +1834,20 @@ impl Session {
             .get("success")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // A model chosen before the runtime started was shown as the session's
+        // model; on failure say it was not applied and show the real one.
+        let deferred_model = {
+            let mut deferred = self
+                .pending_model_request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match deferred.as_ref() {
+                Some((id, _)) if Some(id.as_str()) == value.get("id").and_then(Value::as_str) => {
+                    deferred.take().map(|(_, model)| model)
+                }
+                _ => None,
+            }
+        };
         if !success {
             let message = value
                 .get("error")
@@ -812,15 +1863,38 @@ impl Session {
                 "error",
                 json!({ "code": "runtime-error", "message": message, "retryable": false }),
             );
-            if matches!(self.status(), Status::Starting | Status::Recovering) {
+            // Only a failed handshake makes the session unusable. Any other
+            // command fails alone: its caller gets the error, and a failed
+            // prompt ends its turn. A rejected model switch used to stop the
+            // whole session, and every later message got "session-stopped".
+            if let Some(model) = deferred_model {
+                let name = model.get("model").and_then(Value::as_str).unwrap_or("the chosen model");
+                self.publish(
+                    "session.notice",
+                    json!({
+                        "level": "error",
+                        "message": format!("Could not switch to {name}: {message}. This session keeps the runtime's current model."),
+                    }),
+                );
+                self.set_model(None);
+                self.request_state();
+            }
+            // A refused level leaves the runtime's own; ask which one that is.
+            if reply == pi::Reply::SetThinkingLevel {
+                self.request_state();
+            }
+            if reply.is_handshake() && matches!(self.status(), Status::Starting | Status::Recovering) {
                 self.recovery_failed(message.to_string());
-            } else {
-                self.set_status(Status::Error);
+            } else if reply == pi::Reply::Prompt {
+                self.end_turn(
+                    response_id,
+                    json!({ "aborted": true, "reason": "runtime-error", "message": message }),
+                );
             }
             return;
         }
-        match command {
-            "switch_session" => {
+        match reply {
+            pi::Reply::SwitchSession => {
                 let cancelled = value
                     .get("data")
                     .and_then(|data| data.get("cancelled"))
@@ -844,16 +1918,17 @@ impl Session {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Handshake::Messages;
                 self.request_messages();
             }
-            "get_messages" => {
+            pi::Reply::GetMessages => {
                 // The host's history is the record. After a runtime restart it
                 // already holds every row (including an interrupted reply the
                 // runtime never saved), so only a fresh attach imports.
-                let keep_host_history = matches!(self.status(), Status::Recovering)
-                    && !self
-                        .history
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_empty();
+                // A saved conversation's history was read from its file on open
+                // (`open_saved_history`); the runtime's copy would only renumber it.
+                let keep_host_history = !self
+                    .history
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_empty();
                 if let (false, Some(data)) = (keep_host_history, value.get("data")) {
                     self.import_history(data);
                 }
@@ -866,11 +1941,10 @@ impl Session {
                     if self.release_flow_hold.swap(false, Ordering::SeqCst) {
                         // `/flow clear` releases the withheld request and keeps its
                         // receipts. Finish the handshake when the runtime answers.
-                        let release = json!({
-                            "id": FLOW_RELEASE_ID,
-                            "type": "prompt",
-                            "message": "/flow clear",
-                        });
+                        let release = pi::command::with_id(
+                            pi::command::prompt("/flow clear", &[]),
+                            FLOW_RELEASE_ID,
+                        );
                         if self.write_command(release).is_ok() {
                             return;
                         }
@@ -886,6 +1960,13 @@ impl Session {
         self.recovery_succeeded();
         self.apply_pending_preferences();
         self.flush_pending_prompts();
+        // Start the next warm runtime only now: on a busy machine a second
+        // runtime booting beside this one would slow down the one the user waits for.
+        if let Some(pool) = self.config.warm.get() {
+            let pool = pool.clone();
+            let workspace = PathBuf::from(self.runtime_cwd());
+            tokio::spawn(async move { pool.aim(&workspace) });
+        }
         // A cancelled starting turn has no prompt to flush. Complete the
         // handshake bookkeeping first, then go idle; never go idle while
         // an accepted turn still has an active message.
@@ -900,6 +1981,11 @@ impl Session {
     /// input its Flow control retained). No agent events will follow, so the turn
     /// ends here instead of waiting for `agent_settled`.
     fn end_turn_without_run(self: &Arc<Self>, client_message_id: &str) {
+        self.end_turn(client_message_id, json!({ "status": "handled" }));
+    }
+
+    /// End the active turn for this message without a runtime run.
+    fn end_turn(self: &Arc<Self>, client_message_id: &str, outcome: Value) {
         let matches_active = self
             .active_client_message
             .lock()
@@ -929,12 +2015,42 @@ impl Session {
         self.cancelling.store(false, Ordering::SeqCst);
         self.turn_running.store(false, Ordering::SeqCst);
         if let Some(turn) = turn {
-            self.publish("turn.end", json!({ "turnId": turn, "status": "handled" }));
+            let mut data = json!({ "turnId": turn });
+            if let (Some(data), Some(outcome)) = (data.as_object_mut(), outcome.as_object()) {
+                data.extend(outcome.clone());
+            }
+            self.publish("turn.end", data);
         }
-        if !self.start_queued_turn() {
-            self.set_status(Status::Idle);
-        }
+        self.prompt_echo.store(false, Ordering::SeqCst);
+        self.run_finished();
         self.publish_summary();
+    }
+
+    /// Load the transcript of the session's saved file into the host history.
+    pub(crate) fn open_saved_history(&self) {
+        let Some(path) = self.saved_path() else { return };
+        let started = Instant::now();
+        let Ok(messages) = saved_messages(Path::new(&path)) else { return };
+        let count = messages.len();
+        self.import_history(&Value::Array(messages));
+        // Last changed when the file was, as the saved-session list says.
+        if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+            let mut updated = self.updated_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if updated.is_none() {
+                *updated = Some(DateTime::<Utc>::from(modified).to_rfc3339_opts(SecondsFormat::Millis, true));
+            }
+        }
+        log(
+            &self.home,
+            "info",
+            "session.history",
+            json!({
+                "session": self.id,
+                "messages": count,
+                "rows": self.history.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len(),
+                "elapsedMs": started.elapsed().as_millis() as u64,
+            }),
+        );
     }
 
     fn import_history(&self, data: &Value) {
@@ -950,45 +2066,34 @@ impl Session {
                 .get("role")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            // A tool's result belongs on the reply that called it, as it does
+            // when the turn streams live (`add_to_step_reply`).
+            if role == "toolResult" {
+                let call_id = message.get("toolCallId").and_then(Value::as_str);
+                let reply = rows
+                    .iter_mut()
+                    .rev()
+                    .find(|row: &&mut Value| row.get("kind").and_then(Value::as_str) == Some("assistant"));
+                if let (Some(call_id), Some(blocks)) = (
+                    call_id,
+                    reply.and_then(|row| row.get_mut("blocks")).and_then(Value::as_array_mut),
+                ) {
+                    blocks.push(json!({
+                        "type": "toolResult",
+                        "toolCallId": call_id,
+                        "ok": message.get("isError").and_then(Value::as_bool) != Some(true),
+                        "result": {
+                            "content": message.get("content").cloned().unwrap_or(Value::Null),
+                            "details": message.get("details").cloned().unwrap_or(Value::Null),
+                        },
+                    }));
+                }
+                continue;
+            }
             if role != "user" && role != "assistant" {
                 continue;
             }
-            let mut blocks = Vec::new();
-            if let Some(content) = message.get("content").and_then(Value::as_array) {
-                for block in content {
-                    match block.get("type").and_then(Value::as_str) {
-                        Some("text") => {
-                            if let Some(text) = block.get("text").and_then(Value::as_str) {
-                                blocks.push(json!({ "type": "text", "text": text }));
-                            }
-                        }
-                        Some("thinking") => {
-                            if let Some(text) = block
-                                .get("thinking")
-                                .or_else(|| block.get("text"))
-                                .and_then(Value::as_str)
-                            {
-                                blocks.push(json!({ "type": "thinking", "text": text }));
-                            }
-                        }
-                        Some("toolCall") => {
-                            if let Some(id) = block
-                                .get("toolCallId")
-                                .or_else(|| block.get("id"))
-                                .and_then(Value::as_str)
-                            {
-                                blocks.push(json!({
-                                    "type": "toolCall",
-                                    "toolCallId": id,
-                                    "name": block.get("name").and_then(Value::as_str).unwrap_or("tool"),
-                                    "input": block.get("arguments").or_else(|| block.get("input")).cloned().unwrap_or(Value::Null),
-                                }));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            let blocks = reply_blocks(message);
             let text = blocks
                 .iter()
                 .filter_map(|block| {
@@ -1023,10 +2128,50 @@ impl Session {
                     .map(str::to_string)
                     .unwrap_or_else(Self::now_iso),
             }));
+            if role == "assistant" {
+                if let Some(row) = rows.last_mut() {
+                    for field in ["model", "provider", "usage", "stopReason"] {
+                        if let Some(value) = message.get(field).filter(|value| !value.is_null()) {
+                            row[field] = value.clone();
+                        }
+                    }
+                }
+            }
         }
         if rows.is_empty() {
             return;
         }
+        // A saved conversation is at rest: a tool call with no result was cut off
+        // (the app closed, the runtime stopped). While a turn runs, its own calls
+        // may still be at work, so they are left as they are.
+        let resting = self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none();
+        if resting {
+            for row in rows.iter_mut() {
+                if row.get("kind").and_then(Value::as_str) != Some("assistant") {
+                    continue;
+                }
+                if let Some(blocks) = row.get_mut("blocks").and_then(Value::as_array_mut) {
+                    close_unfinished_calls(blocks);
+                }
+            }
+        }
+        // Titled as the session list titles a saved file: by its first message.
+        let first = rows
+            .iter()
+            .find(|row| row.get("kind").and_then(Value::as_str) == Some("user"))
+            .and_then(|row| row.get("text").and_then(Value::as_str))
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "));
+        if let Some(first) = first.filter(|text| !text.is_empty()) {
+            let mut title = self.title.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if title.is_empty() {
+                *title = first.chars().take(80).collect();
+            }
+        }
+        let count = rows.len();
         self.history
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1035,6 +2180,8 @@ impl Session {
         for row in rows {
             self.push_history(row);
         }
+        // A client that read the history before this replaced it reads it again.
+        self.publish("session.history", json!({ "rows": count }));
     }
 
     fn handle_runtime_line(self: &Arc<Self>, value: Value) {
@@ -1042,17 +2189,50 @@ impl Session {
         match pi::classify(&value) {
             PiRecord::Response => self.handle_response(&value),
             PiRecord::AgentStart => {
+                // Waiting messages go in once the first reply starts.
+                self.replying.store(false, Ordering::SeqCst);
                 self.set_status(Status::Running);
-                if let Some(message_id) = self
-                    .active_message
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                {
-                    self.publish(
-                        "message.start",
-                        json!({ "messageId": message_id, "turnId": message_id, "role": "assistant" }),
-                    );
+            }
+            PiRecord::TurnStart => {
+                if self.active_turn_id().is_some() {
+                    self.begin_step();
+                }
+            }
+            PiRecord::TurnEnd => {}
+            PiRecord::QueueUpdate => self.runtime_queue_changed(&value),
+            PiRecord::MessageStart => {
+                let role = value
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str);
+                if role == Some("user") {
+                    self.user_message_started(value.get("message"));
+                    return;
+                }
+                let assistant = role == Some("assistant");
+                if assistant && !self.replying.swap(true, Ordering::SeqCst) {
+                    self.steer_queue();
+                }
+                if assistant && self.active_turn_id().is_some() {
+                    // A second reply in one step is a step the runtime did not mark.
+                    let (n, written) = {
+                        let step = self.step_guard();
+                        (step.n, step.row.is_some())
+                    };
+                    if n == 0 || written {
+                        self.begin_step();
+                    }
+                }
+            }
+            PiRecord::MessageEnd => {
+                let message = value.get("message");
+                let assistant = message
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("assistant");
+                if let (true, Some(turn)) = (assistant, self.active_turn_id()) {
+                    self.ensure_step();
+                    self.finish_step_reply(&turn, message, false);
                 }
             }
             PiRecord::MessageUpdate => {
@@ -1063,23 +2243,20 @@ impl Session {
                     return;
                 };
                 let kind = pi::delta_kind(&value);
-                let active = self
-                    .active_message
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                let Some(message_id) = active else {
+                let Some(message_id) = self.active_turn_id() else {
                     return;
                 };
                 match kind {
                     DeltaKind::Text => {
                         let text = pi::delta_text(&value);
                         if !text.is_empty() {
+                            self.ensure_step();
                             self.assistant_text
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .push_str(text);
                             self.append_assistant_block("text", text);
+                            self.step_output("writing");
                             self.publish(
                                 "message.delta",
                                 json!({ "messageId": message_id, "text": text }),
@@ -1089,12 +2266,18 @@ impl Session {
                     DeltaKind::Thinking => {
                         let text = pi::delta_text(&value);
                         if !text.is_empty() {
+                            self.ensure_step();
                             self.append_assistant_block("thinking", text);
+                            self.step_output("thinking");
                             self.publish(
                                 "message.delta",
                                 json!({ "messageId": message_id, "text": text, "kind": "thinking" }),
                             );
                         }
+                    }
+                    DeltaKind::ToolCall => {
+                        self.ensure_step();
+                        self.step_output("calling_tool");
                     }
                     DeltaKind::Other => {}
                 }
@@ -1105,23 +2288,36 @@ impl Session {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                let name = value
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
                 if !call_id.is_empty() {
-                    self.push_assistant_tool_call(
-                        &call_id,
-                        value.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
-                        value.get("args").cloned().unwrap_or(Value::Null),
-                    );
+                    if self.active_turn_id().is_some() {
+                        self.ensure_step();
+                    }
+                    self.add_to_step_reply(json!({
+                        "type": "toolCall",
+                        "toolCallId": call_id,
+                        "name": name,
+                        "input": value.get("args").cloned().unwrap_or(Value::Null),
+                    }));
                     self.push_history(json!({
                         "kind": "tool",
                         "id": format!("tool:{call_id}"),
+                        "turnId": self.active_turn_id(),
                         "tool": {
-                            "name": value.get("toolName").and_then(Value::as_str).unwrap_or("tool"),
+                            "name": name,
                             "callId": call_id,
                             "status": "running",
                         },
                         "args": value.get("args"),
                         "createdAt": Self::now_iso(),
                     }));
+                    self.step_guard()
+                        .tools
+                        .push((call_id.clone(), name.clone(), Instant::now()));
                 }
                 self.publish(
                     "tool.start",
@@ -1129,8 +2325,11 @@ impl Session {
                         "toolCallId": value.get("toolCallId"),
                         "toolName": value.get("toolName"),
                         "args": value.get("args"),
+                        "step": self.step_guard().n,
                     }),
                 );
+                self.step_output("tools");
+                self.publish_summary();
             }
             PiRecord::ToolUpdate => {
                 self.publish(
@@ -1147,28 +2346,70 @@ impl Session {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                self.push_assistant_tool_result(
-                    &call_id,
-                    value.get("isError").and_then(Value::as_bool) != Some(true),
-                    value.get("result").cloned().unwrap_or(Value::Null),
-                );
+                let ok = value.get("isError").and_then(Value::as_bool) != Some(true);
+                self.add_to_step_reply(json!({
+                    "type": "toolResult",
+                    "toolCallId": call_id,
+                    "ok": ok,
+                    "result": value.get("result").cloned().unwrap_or(Value::Null),
+                }));
                 self.update_history_tool(
                     &call_id,
-                    if value.get("isError").and_then(Value::as_bool) == Some(true) {
-                        "error"
-                    } else {
-                        "ok"
-                    },
+                    if ok { "ok" } else { "error" },
                     value.get("result").cloned().unwrap_or(Value::Null),
                 );
+                let finished = {
+                    let mut step = self.step_guard();
+                    let at = step.tools.iter().position(|(id, _, _)| *id == call_id);
+                    at.map(|at| step.tools.remove(at))
+                };
+                if let Some((_, name, started)) = finished {
+                    self.log_step(
+                        "tool.end",
+                        json!({ "tool": name, "ok": ok, "elapsedMs": started.elapsed().as_millis() as u64 }),
+                    );
+                }
                 self.publish(
                     "tool.result",
                     json!({
                         "toolCallId": value.get("toolCallId"),
-                        "ok": value.get("isError").and_then(Value::as_bool) != Some(true),
+                        "ok": ok,
                         "result": value.get("result"),
                     }),
                 );
+                self.publish_summary();
+            }
+            PiRecord::RetryStart => {
+                let retry = json!({
+                    "attempt": value.get("attempt"),
+                    "maxAttempts": value.get("maxAttempts"),
+                    "delayMs": value.get("delayMs"),
+                    "error": value.get("errorMessage"),
+                });
+                self.log_step("retry.start", retry.clone());
+                self.step_guard().retry = Some(retry);
+                self.set_step_state("retrying");
+                self.publish_summary();
+            }
+            PiRecord::RetryEnd => {
+                self.log_step(
+                    "retry.end",
+                    json!({ "success": value.get("success"), "attempt": value.get("attempt") }),
+                );
+                self.step_guard().retry = None;
+                self.set_step_state("waiting_model");
+                self.publish_summary();
+            }
+            PiRecord::CompactionStart => {
+                self.log_step("compaction.start", json!({ "reason": value.get("reason") }));
+                self.set_step_state("compacting");
+            }
+            PiRecord::CompactionEnd => {
+                self.log_step(
+                    "compaction.end",
+                    json!({ "reason": value.get("reason"), "aborted": value.get("aborted") }),
+                );
+                self.set_step_state("waiting_model");
             }
             PiRecord::CustomMessage => {
                 let custom_type = value
@@ -1216,57 +2457,9 @@ impl Session {
                     .take();
                 if let Some(message_id) = active {
                     let stop_reason = if aborted { "interrupted" } else { "completed" };
-                    let text = std::mem::take(
-                        &mut *self
-                            .assistant_text
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                    );
-                    let blocks = self.take_assistant_blocks(&text);
-                    let mut row = json!({
-                        "kind": "assistant",
-                        "id": format!("{message_id}:assistant"),
-                        "turnId": message_id.clone(),
-                        "text": text,
-                        "blocks": blocks,
-                        "createdAt": Self::now_iso(),
-                    });
-                    if let Some(message) = value.get("message") {
-                        for field in ["model", "provider", "usage"] {
-                            if let Some(field_value) = message.get(field) {
-                                row[field] = field_value.clone();
-                            }
-                        }
-                    }
-                    if row.get("model").map(Value::is_null).unwrap_or(true) {
-                        if let Some(model) = self
-                            .model
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone()
-                        {
-                            row["model"] = model
-                                .get("name")
-                                .or_else(|| model.get("id"))
-                                .cloned()
-                                .unwrap_or(Value::Null);
-                            if let Some(provider) = model.get("provider") {
-                                row["provider"] = provider.clone();
-                            }
-                        }
-                    }
-                    self.push_history(row.clone());
-                    self.publish(
-                        "message.done",
-                        json!({
-                            "messageId": message_id,
-                            "stopReason": stop_reason,
-                            "blocks": row.get("blocks").cloned().unwrap_or_else(|| json!([])),
-                            "model": row.get("model").cloned().unwrap_or(Value::Null),
-                            "provider": row.get("provider").cloned().unwrap_or(Value::Null),
-                            "usage": row.get("usage").cloned().unwrap_or(Value::Null),
-                        }),
-                    );
+                    // Whatever the last step had not finished writing is its reply.
+                    self.finish_step_reply(&message_id, None, aborted);
+                    self.close_unfinished_tools();
                     self.publish(
                         "turn.end",
                         json!({ "turnId": message_id, "status": stop_reason }),
@@ -1287,9 +2480,10 @@ impl Session {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 self.cancelling.store(false, Ordering::SeqCst);
                 self.turn_running.store(false, Ordering::SeqCst);
-                if !self.start_queued_turn() {
-                    self.set_status(Status::Idle);
-                }
+                self.prompt_echo.store(false, Ordering::SeqCst);
+                // Steered messages the run did not reach are taken back before
+                // anything else is sent, so the runtime cannot use them twice.
+                self.run_finished();
                 self.publish_summary();
             }
             PiRecord::ExtensionUiRequest => self.handle_extension_ui_request(&value),
@@ -1298,6 +2492,13 @@ impl Session {
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("extension error");
+                // A replaced session can leave one extension holding its previous context.
+                // That lifecycle race changes neither the transcript nor this session, so it
+                // is not a session failure (the same rule the UI kept before the host).
+                if message.to_lowercase().contains("extension ctx is stale") {
+                    log(&self.home, "warn", "extension.stale_ctx", json!({ "session": self.id, "message": message }));
+                    return;
+                }
                 self.publish(
                     "error",
                     json!({ "code": "extension-error", "message": message, "retryable": false }),
@@ -1322,6 +2523,82 @@ impl Session {
         match value.get("method").and_then(Value::as_str).unwrap_or("") {
             "confirm" => self.request_approval(value),
             "select" | "input" | "editor" => self.request_question(value),
+            // Fire-and-forget notices: the runtime's only channel for command replies
+            // (`/flow`, `/textguard`) and for Flow holds. Dropping them leaves a held
+            // message looking like an endless stall.
+            "notify" => {
+                let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+                if message.trim().is_empty() {
+                    return;
+                }
+                let level = match value.get("notifyType").and_then(Value::as_str) {
+                    Some("error") => "error",
+                    Some("warning") => "warning",
+                    _ => "info",
+                };
+                let mut notice = json!({ "message": message, "level": level });
+                if let Some(command) = self.notice_origin() {
+                    notice["command"] = command;
+                }
+                self.publish("session.notice", notice);
+            }
+            "setStatus" => {
+                let Some(key) = value.get("statusKey").and_then(Value::as_str) else {
+                    return;
+                };
+                let text = value
+                    .get("statusText")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty());
+                let changed = {
+                    let mut statuses = self
+                        .ui_statuses
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match text {
+                        Some(text) => {
+                            statuses
+                                .insert(key.to_string(), text.to_string())
+                                .as_deref()
+                                != Some(text)
+                        }
+                        None => statuses.remove(key).is_some(),
+                    }
+                };
+                if changed {
+                    self.publish_summary();
+                }
+            }
+            "setWidget" => {
+                let Some(key) = value.get("widgetKey").and_then(Value::as_str) else {
+                    return;
+                };
+                let lines: Vec<String> = value
+                    .get("widgetLines")
+                    .and_then(Value::as_array)
+                    .map(|lines| {
+                        lines
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let changed = {
+                    let mut widgets = self
+                        .ui_widgets
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if lines.is_empty() {
+                        widgets.remove(key).is_some()
+                    } else {
+                        widgets.insert(key.to_string(), lines.clone()).as_ref() != Some(&lines)
+                    }
+                };
+                if changed {
+                    self.publish_summary();
+                }
+            }
             method => log(
                 &self.home,
                 "debug",
@@ -1498,11 +2775,7 @@ impl Session {
         data["state"] = Value::String("expired".to_string());
         data["decision"] = Value::String("expired".to_string());
         data["answeredBy"] = Value::Null;
-        let _ = self.write_command(json!({
-            "type": "extension_ui_response",
-            "id": entry.pi_id,
-            "cancelled": true,
-        }));
+        let _ = self.write_command(pi::command::ui_cancelled(&entry.pi_id));
         self.publish("approval.resolved", data);
         self.restore_running_status();
     }
@@ -1518,11 +2791,7 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(question_id.to_string(), "expired".to_string());
-        let _ = self.write_command(json!({
-            "type": "extension_ui_response",
-            "id": entry.pi_id,
-            "cancelled": true,
-        }));
+        let _ = self.write_command(pi::command::ui_cancelled(&entry.pi_id));
         self.publish(
             "question.cancelled",
             json!({ "questionId": question_id, "reason": "expired" }),
@@ -1650,11 +2919,7 @@ impl Session {
             ));
         }
         let confirmed = decision == "Approve";
-        let response = json!({
-            "type": "extension_ui_response",
-            "id": entry.pi_id,
-            "confirmed": confirmed,
-        });
+        let response = pi::command::ui_confirmed(&entry.pi_id, confirmed);
         if let Err(error) = self.write_command(response) {
             self.pending_approvals
                 .lock()
@@ -1721,11 +2986,7 @@ impl Session {
             .and_then(|item_id| answers.get(item_id))
             .cloned()
             .unwrap_or_default();
-        let response = json!({
-            "type": "extension_ui_response",
-            "id": entry.pi_id,
-            "value": value,
-        });
+        let response = pi::command::ui_value(&entry.pi_id, &value);
         if let Err(error) = self.write_command(response) {
             self.pending_questions
                 .lock()
@@ -1894,9 +3155,16 @@ impl Session {
                     false,
                 ));
             }
+            let waiting = self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|item| item.client_message_id() == Some(client_message_id));
             return Ok(json!({
                 "messageId": existing.message_id.clone(),
                 "receipt": "queued",
+                "waiting": waiting,
             }));
         }
         if self.active_turn().is_some() {
@@ -1904,35 +3172,46 @@ impl Session {
                 .failed_turn
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            // A turn is already starting/running. The host owns the follow-up
-            // prompt, not the composer: queue it, show it in history, and deliver
-            // it when the current turn ends.
+            // A turn is already starting/running. The host owns the message, not
+            // the composer: it waits in the queue (shown above the composer) and
+            // is handed to the running turn as steer. It joins the transcript when
+            // the runtime uses it, or starts the next turn if this one ends first.
             let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
             let message_id = format!("m-{counter}");
-            let history_row = json!({
+            let stored_attachments = self.store_attachments(attachments)?;
+            let mut row = json!({
                 "kind": "user",
                 "id": format!("{message_id}:user"),
                 "turnId": message_id,
+                "clientMessageId": client_message_id,
                 "text": text,
                 "blocks": [{ "type": "text", "text": text }],
-                "createdAt": Self::now_iso(),
-                "queued": true,
             });
-            self.push_history(history_row);
+            if !stored_attachments.is_empty() {
+                row["attachments"] = json!(stored_attachments);
+            }
             self.remember_turn(text);
             self.publish(
                 "message.accepted",
-                json!({ "messageId": message_id.clone(), "receipt": "queued" }),
+                json!({ "messageId": message_id.clone(), "receipt": "queued", "waiting": true, "clientMessageId": client_message_id }),
             );
-            let prompt = json!({
-                "id": client_message_id,
-                "type": "prompt",
-                "message": text,
-            });
+            let images: Vec<(&str, &str)> = attachments
+                .iter()
+                .map(|attachment| (attachment.mime_type.as_str(), attachment.data.as_str()))
+                .collect();
+            let prompt =
+                pi::command::with_id(pi::command::prompt(text, &images), client_message_id);
             self.queued_turns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_back((message_id.clone(), prompt));
+                .push_back(Queued {
+                    turn: message_id.clone(),
+                    prompt,
+                    row: Some(row),
+                    steered: None,
+                    no_steer: false,
+                    held: false,
+                });
             messages.insert(
                 client_message_id.to_string(),
                 SentMessage {
@@ -1940,8 +3219,11 @@ impl Session {
                     text: text.to_string(),
                 },
             );
+            drop(messages);
+            self.steer_queue();
             self.publish_summary();
-            return Ok(json!({ "messageId": message_id, "receipt": "queued" }));        }
+            return Ok(json!({ "messageId": message_id, "receipt": "queued", "waiting": true }));
+        }
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let message_id = format!("m-{counter}");
         *self
@@ -1972,6 +3254,8 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.reset_step();
+        self.prompt_echo.store(true, Ordering::SeqCst);
         let stored_attachments = self.store_attachments(attachments)?;
         let mut history_row = json!({
             "kind": "user",
@@ -2008,30 +3292,24 @@ impl Session {
             "message.accepted",
             json!({ "messageId": message_id.clone(), "receipt": "queued" }),
         );
-        let was_pending = matches!(self.status(), Status::Pending);
+        // Running only once the runtime has the session, as the summary says.
+        let starting = matches!(
+            self.status(),
+            Status::Pending | Status::Starting | Status::Recovering
+        );
         self.publish(
             "turn.start",
             json!({
                 "turnId": message_id.clone(),
-                "phase": if was_pending { "starting" } else { "running" },
+                "phase": if starting { "starting" } else { "running" },
             }),
         );
         self.publish_summary();
-        let mut prompt = json!({
-            "id": client_message_id,
-            "type": "prompt",
-            "message": text,
-        });
-        if !attachments.is_empty() {
-            prompt["images"] = json!(attachments
-                .iter()
-                .map(|attachment| json!({
-                    "type": "image",
-                    "data": attachment.data,
-                    "mimeType": attachment.mime_type,
-                }))
-                .collect::<Vec<_>>());
-        }
+        let images: Vec<(&str, &str)> = attachments
+            .iter()
+            .map(|attachment| (attachment.mime_type.as_str(), attachment.data.as_str()))
+            .collect();
+        let prompt = pi::command::with_id(pi::command::prompt(text, &images), client_message_id);
         if matches!(self.status(), Status::Pending) {
             self.set_status(Status::Starting);
             self.start(true);
@@ -2105,13 +3383,26 @@ impl Session {
                 .queued_turns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let before = queue.len();
-            queue.retain(|(_, prompt)| {
-                prompt.get("id").and_then(Value::as_str) != Some(client_message_id)
-            });
-            before != queue.len()
+            let at = queue
+                .iter()
+                .position(|item| item.client_message_id() == Some(client_message_id));
+            if at.is_some_and(|at| queue[at].held) {
+                // Flow has it and will deliver it; removing it here would not stop that.
+                return Err(ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "message-held",
+                    "Flow control is holding this message; run /flow to release or cancel it",
+                    false,
+                ));
+            }
+            at.and_then(|at| queue.remove(at))
         };
-        if removed {
+        if let Some(item) = removed {
+            if item.steered.is_some() {
+                // The runtime holds the removed message too: take its queue
+                // back; the rest are handed over again once it has answered.
+                self.clear_runtime_queue();
+            }
             self.publish_summary();
             return Ok(json!({ "status": "cancelled" }));
         }
@@ -2136,6 +3427,7 @@ impl Session {
         let started = if self.status() == Status::Idle && self.active_turn().is_none() {
             self.start_queued_turn()
         } else {
+            self.steer_queue();
             false
         };
         self.publish_summary();
@@ -2168,11 +3460,11 @@ impl Session {
             .to_string();
         let counter = self.next_message.fetch_add(1, Ordering::Relaxed) + 1;
         let turn = format!("m-{counter}");
-        let prompt = json!({ "id": client_message_id, "type": "prompt", "message": text });
+        let prompt = pi::command::with_id(pi::command::prompt(&text, &[]), &client_message_id);
         self.queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push_front((turn, prompt));
+            .push_front(Queued { turn, prompt, row: None, steered: None, no_steer: true, held: false });
         self.queue_paused.store(false, Ordering::SeqCst);
         if self.active_turn().is_none() {
             self.start_queued_turn();
@@ -2182,6 +3474,7 @@ impl Session {
     }
 
     pub fn discard_queue(&self) -> Result<Value, ApiError> {
+        self.reclaim_steered();
         self.queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2229,7 +3522,7 @@ impl Session {
             }
         }
         let id = self.request_id();
-        self.write_command(json!({ "id": id, "type": "abort" }))
+        self.write_command(pi::command::with_id(pi::command::abort(), &id))
     }
 
     pub async fn request(&self, mut command: Value, timeout: Duration) -> Result<Value, ApiError> {
@@ -2382,17 +3675,105 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 Some(json!({ "provider": provider, "model": model }));
+            // The runtime applies it once started; the session's model is the
+            // choice from now on, so every client shows the same one.
+            let chosen = json!({ "provider": provider, "id": model });
+            self.set_model(Some(chosen.clone()));
             return Ok(json!({ "provider": provider, "id": model, "name": model }));
         }
         self.request(
-            json!({ "type": "set_model", "provider": provider, "modelId": model }),
+            pi::command::set_model(provider, model),
             Duration::from_secs(30),
         )
         .await?;
         let state = self
-            .request(json!({ "type": "get_state" }), Duration::from_secs(10))
+            .request(pi::command::get_state(), Duration::from_secs(10))
             .await?;
-        Ok(state.get("model").cloned().unwrap_or(Value::Null))
+        let selected = state.get("model").cloned().unwrap_or(Value::Null);
+        if !selected.is_null() {
+            self.set_model(Some(selected.clone()));
+        }
+        Ok(selected)
+    }
+
+    /// A new conversation with no model yet starts from the default. A saved
+    /// one is left alone: the runtime restores its model and reports it.
+    pub fn adopt_default_model(&self, model: Option<Value>) {
+        let Some(model) = model else {
+            return;
+        };
+        let unset = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none();
+        if !self.fresh.load(Ordering::SeqCst) {
+            // Shown until the runtime reports its own: the model the file
+            // last used, as the runtime restores it, else the default it
+            // falls back to. Display only; nothing is applied to the runtime.
+            if unset {
+                let saved = self.saved_path().and_then(|path| saved_model(Path::new(&path)));
+                self.set_model(Some(saved.unwrap_or(model)));
+            }
+            return;
+        }
+        let unset = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none();
+        if !unset {
+            return;
+        }
+        // The shown model is the one the runtime uses: apply it on start like a choice.
+        if let (Some(provider), Some(id)) = (
+            model.get("provider").and_then(Value::as_str),
+            model.get("id").and_then(Value::as_str),
+        ) {
+            let mut pending = self
+                .pending_model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if pending.is_none() {
+                *pending = Some(json!({ "provider": provider, "model": id }));
+            }
+        }
+        self.set_model(Some(model));
+    }
+
+    /// The reasoning level is part of the session summary; publish it when it changes.
+    fn set_thinking_level(&self, level: Option<String>) {
+        let changed = {
+            let mut current = self
+                .thinking_level
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let changed = *current != level;
+            *current = level;
+            changed
+        };
+        if changed {
+            self.publish_summary();
+        }
+    }
+
+    /// The model is part of the session summary; publish it when it changes.
+    fn set_model(&self, model: Option<Value>) {
+        let changed = {
+            let mut current = self
+                .model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *current == model {
+                false
+            } else {
+                *current = model;
+                true
+            }
+        };
+        if changed {
+            self.publish_summary();
+        }
     }
 
     pub async fn select_thinking(&self, level: &str) -> Result<Value, ApiError> {
@@ -2404,13 +3785,15 @@ impl Session {
                 .pending_thinking
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(level.to_string());
+            self.set_thinking_level(Some(level.to_string()));
             return Ok(json!({ "level": level }));
         }
         self.request(
-            json!({ "type": "set_thinking_level", "level": level }),
+            pi::command::set_thinking_level(level),
             Duration::from_secs(30),
         )
         .await?;
+        self.set_thinking_level(Some(level.to_string()));
         Ok(json!({ "level": level }))
     }
 
@@ -2428,12 +3811,15 @@ impl Session {
                 return;
             };
             let request = self.request_id();
-            let _ = self.write_command(json!({
-                "id": request,
-                "type": "set_model",
-                "provider": provider,
-                "modelId": id,
-            }));
+            *self
+                .pending_model_request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((request.clone(), model.clone()));
+            let _ = self.write_command(pi::command::with_id(
+                pi::command::set_model(provider, id),
+                &request,
+            ));
         }
         let level = self
             .pending_thinking
@@ -2442,11 +3828,10 @@ impl Session {
             .take();
         if let Some(level) = level {
             let request = self.request_id();
-            let _ = self.write_command(json!({
-                "id": request,
-                "type": "set_thinking_level",
-                "level": level,
-            }));
+            let _ = self.write_command(pi::command::with_id(
+                pi::command::set_thinking_level(&level),
+                &request,
+            ));
         }
     }
 
@@ -2460,11 +3845,7 @@ impl Session {
         } else {
             Status::Stopped
         });
-        self.recovery_scheduled.store(false, Ordering::SeqCst);
-        self.recovery_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        self.restarts.reset();
         self.cancel_pending("session-stopped");
         let runtime = self
             .runtime
@@ -2499,7 +3880,13 @@ impl Session {
                 .clone(),
             "status": self.status().as_str(),
             "running": self.status() == Status::Running,
+            "activeTurn": self.active_turn_view(self.status()),
             "runtimePid": self.runtime_pid(),
+            "model": self
+                .model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             "runtimeParseErrors": self.runtime_parse_errors(),
             "cursor": self.cursor(),
             "pendingApprovals": self.pending_approvals(),
@@ -2509,10 +3896,9 @@ impl Session {
         })
     }
 
-    pub fn summary(&self) -> Value {
-        let status = self.status();
-        let active_turn = self
-            .active_message
+    /// The turn in progress, as the session list and the session detail both show it.
+    fn active_turn_view(&self, status: Status) -> Option<Value> {
+        self.active_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -2521,7 +3907,7 @@ impl Session {
                     "cancelling"
                 } else {
                     match status {
-                        Status::Starting | Status::Recovering => "starting",
+                        Status::Pending | Status::Starting | Status::Recovering => "starting",
                         Status::Running | Status::WaitingApproval | Status::WaitingQuestion => "running",
                         _ => "accepted",
                     }
@@ -2534,27 +3920,45 @@ impl Session {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone(),
                     "phase": phase,
+                    "step": self.step_view(),
                     "startedAt": self
                         .turn_started_at
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone(),
                 })
-            });
+            })
+    }
+
+    pub fn summary(&self) -> Value {
+        let status = self.status();
+        let active_turn = self.active_turn_view(status);
         let queue: Vec<Value> = self
             .queued_turns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .map(|(turn_id, prompt)| {
+            .map(|item| {
                 json!({
-                    "turnId": turn_id,
-                    "clientMessageId": prompt.get("id").and_then(Value::as_str),
-                    "text": prompt.get("message").and_then(Value::as_str),
-                    "state": if self.queue_paused.load(Ordering::Relaxed) { "paused" } else { "queued" },
+                    "turnId": item.turn,
+                    "clientMessageId": item.client_message_id(),
+                    "text": item.text(),
+                    "images": item.prompt.get("images").and_then(Value::as_array).map_or(0, Vec::len),
+                    "state": if item.held { "held" } else if self.queue_paused.load(Ordering::Relaxed) { "paused" } else { "queued" },
                 })
             })
             .collect();
+        let first_output = {
+            let first = self
+                .first_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            json!({
+                "turns": first.count,
+                "avgMs": (first.count > 0).then(|| first.total_ms / first.count),
+                "lastMs": first.last_ms,
+            })
+        };
         json!({
             "sessionId": self.id,
             "sessionPath": self
@@ -2565,6 +3969,10 @@ impl Session {
             "sessionSeq": self.cursor(),
             "status": status.as_str(),
             "activeTurn": active_turn,
+            "pendingApprovals": self.pending_approvals(),
+            "pendingQuestions": self.pending_questions(),
+            "statuses": self.ui_statuses(),
+            "widgets": self.ui_widgets(),
             "queue": queue,
             "failedTurn": self
                 .failed_turn
@@ -2590,7 +3998,12 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
-            "thinkingLevel": Value::Null,
+            "thinkingLevel": self
+                .thinking_level
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            "firstOutput": first_output,
             "runtime": {
                 "attached": self.runtime_pid().is_some(),
                 "recovering": status == Status::Recovering,
@@ -2618,13 +4031,19 @@ impl Session {
             tx,
             runtime: Mutex::new(None),
             runtime_generation: AtomicU64::new(0),
-            recovery_attempts: Mutex::new(Vec::new()),
-            recovery_scheduled: AtomicBool::new(false),
+            restarts: Default::default(),
             config: config.clone(),
             lease_path,
             messages: Mutex::new(HashMap::new()),
             queued_turns: Mutex::new(VecDeque::new()),
+            steer_generation: AtomicU64::new(0),
+            replying: AtomicBool::new(false),
+            steers_in_flight: AtomicUsize::new(0),
+            reclaim_waiting: AtomicBool::new(false),
+            fresh: AtomicBool::new(false),
+            prompt_echo: AtomicBool::new(false),
             queue_paused: AtomicBool::new(false),
+            first_output_turn: Mutex::new(None),
             pending_prompts: Mutex::new(Vec::new()),
             next_message: AtomicU64::new(0),
             next_request: AtomicU64::new(0),
@@ -2634,6 +4053,7 @@ impl Session {
             cancelling: AtomicBool::new(false),
             turn_running: AtomicBool::new(false),
             release_flow_hold: AtomicBool::new(false),
+            commands: Mutex::new(Vec::new()),
             cancelled: Mutex::new(HashMap::new()),
             failed_turn: Mutex::new(None),
             listed: Mutex::new(false),
@@ -2643,6 +4063,8 @@ impl Session {
             ready: tokio::sync::Notify::new(),
             pending_approvals: Mutex::new(HashMap::new()),
             pending_questions: Mutex::new(HashMap::new()),
+            ui_statuses: Mutex::new(BTreeMap::new()),
+            ui_widgets: Mutex::new(BTreeMap::new()),
             approval_outcomes: Mutex::new(HashMap::new()),
             question_outcomes: Mutex::new(HashMap::new()),
             next_prompt: AtomicU64::new(0),
@@ -2652,10 +4074,15 @@ impl Session {
             history_seq: AtomicU64::new(0),
             assistant_text: Mutex::new(String::new()),
             assistant_blocks: Mutex::new(Vec::new()),
+            step: Mutex::new(StepState::new()),
             active_client: Mutex::new(None),
             model: Mutex::new(None),
             pending_model: Mutex::new(None),
+            pending_model_request: Mutex::new(None),
             pending_thinking: Mutex::new(None),
+            first_output: Mutex::new(FirstOutput::default()),
+            warm_attach: Mutex::new(None),
+            thinking_level: Mutex::new(None),
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
             last_activity: Mutex::new(Instant::now()),
@@ -2683,17 +4110,67 @@ impl Session {
         self.spawn_runtime(true, from_pending);
     }
 
+    /// The folder the runtime starts in: the session file's own folder text when
+    /// it has one, so the handshake's switch keeps the loaded extensions.
+    fn runtime_cwd(&self) -> String {
+        self.session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .and_then(|path| session_header_cwd(&path))
+            .unwrap_or_else(|| canonical_path(&self.workspace_path))
+    }
+
     fn spawn_spec(&self) -> SpawnSpec {
         SpawnSpec {
             program: self.config.spec.program.clone(),
             args: self.config.spec.args.clone(),
             env: self.environment(),
-            workspace: PathBuf::from(&self.workspace_path),
+            workspace: PathBuf::from(self.runtime_cwd()),
+            low_priority: false,
         }
     }
 
     fn spawn_runtime(self: &Arc<Self>, initial: bool, from_pending: bool) -> bool {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+        // A warm runtime is switched to this session's file by the handshake, so
+        // only a session with a file can take one.
+        let has_file = self
+            .session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if let (true, Some(pool)) = (has_file, self.config.warm.get()) {
+            let before = pool.status();
+            if let Some((runtime, matched, attaching)) =
+                pool.take(event_tx.clone(), Path::new(&self.runtime_cwd()))
+            {
+                *self
+                    .warm_attach
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((attaching, Instant::now()));
+                log(
+                    &self.home,
+                    "info",
+                    "runtime.warm_taken",
+                    json!({
+                        "session": self.id,
+                        "pid": runtime.pid(),
+                        "sameWorkspace": matched,
+                        "warm": before,
+                    }),
+                );
+                self.install_runtime(runtime, event_rx);
+                return true;
+            }
+            pool.reset_failures();
+            log(
+                &self.home,
+                "info",
+                "runtime.cold_start",
+                json!({ "session": self.id, "warm": before }),
+            );
+        }
         match RuntimeSupervisor::start(self.spawn_spec(), event_tx) {
             Ok(runtime) => {
                 self.install_runtime(runtime, event_rx);
@@ -2733,7 +4210,7 @@ impl Session {
             .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
-        self.recovery_scheduled.store(false, Ordering::SeqCst);
+        self.restarts.settle();
         let session = self.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
@@ -2750,12 +4227,13 @@ impl Session {
         if matches!(self.status(), Status::Stopped | Status::Error) {
             return;
         }
-        if self.recovery_scheduled.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let count = self.record_recovery_attempt();
-        if count >= 3 {
-            self.recovery_scheduled.store(false, Ordering::SeqCst);
+        use crate::runtime::restart::Decision;
+        let count = match self.restarts.decide() {
+            Decision::AlreadyScheduled => return,
+            Decision::Restart(count) => count,
+            Decision::GiveUp => 0,
+        };
+        if count == 0 {
             self.set_status(Status::Error);
             self.publish(
                 "error",
@@ -2783,7 +4261,7 @@ impl Session {
 
     async fn restart_runtime(self: &Arc<Self>) {
         if matches!(self.status(), Status::Stopped | Status::Error) {
-            self.recovery_scheduled.store(false, Ordering::SeqCst);
+            self.restarts.settle();
             return;
         }
         let previous = self
@@ -2801,19 +4279,15 @@ impl Session {
     }
 
     fn recovery_failed(self: &Arc<Self>, reason: String) {
-        self.recovery_scheduled.store(false, Ordering::SeqCst);
-        let count = self
-            .recovery_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len();
+        self.restarts.settle();
+        let count = self.restarts.attempts();
         log(
             &self.home,
             "warn",
             "runtime.recovery_failed",
             json!({ "reason": reason, "attempts": count }),
         );
-        if count >= 3 {
+        if self.restarts.exhausted() {
             self.set_status(Status::Error);
             self.publish(
                 "error",
@@ -2832,36 +4306,30 @@ impl Session {
         });
     }
 
-    fn record_recovery_attempt(&self) -> usize {
-        let now = Instant::now();
-        let mut attempts = self
-            .recovery_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        attempts.retain(|attempt| now.duration_since(*attempt) < Duration::from_secs(300));
-        attempts.push(now);
-        attempts.len()
-    }
-
     fn recovery_succeeded(&self) {
         // Attempts are kept for the five-minute window: a runtime that reaches
         // idle and dies again immediately is flapping, not healthy.
-        self.recovery_scheduled.store(false, Ordering::SeqCst);
+        self.restarts.settle();
     }
 
     fn start_queued_turn(self: &Arc<Self>) -> bool {
         if self.queue_paused.load(Ordering::Relaxed) {
             return false;
         }
-        let Some((turn, prompt)) = self
-            .queued_turns
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pop_front()
-        else {
+        let Some(item) = ({
+            let mut queue = self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A held message is its extension's to release; sending it too would send it twice.
+            queue.iter().position(|item| !item.held).and_then(|at| queue.remove(at))
+        }) else {
             return false;
         };
-        self.place_started_row(&turn);
+        let Queued { turn, prompt, row, .. } = item;
+        if let Some(row) = row.clone() {
+            self.deliver_user_row(row, &turn);
+        }
         *self
             .active_message
             .lock()
@@ -2883,6 +4351,8 @@ impl Session {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.reset_step();
+        self.prompt_echo.store(true, Ordering::SeqCst);
         self.publish(
             "turn.start",
             json!({ "turnId": turn, "phase": "running" }),
@@ -2893,7 +4363,7 @@ impl Session {
             self.queued_turns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_front((turn.clone(), prompt));
+                .push_front(Queued { turn: turn.clone(), prompt, row: None, steered: None, no_steer: true, held: false });
             *self
                 .active_message
                 .lock()
@@ -2931,42 +4401,12 @@ impl Session {
     }
 
     fn environment(&self) -> Vec<(OsString, OsString)> {
-        let mut environment: HashMap<String, (OsString, OsString)> = std::env::vars_os()
-            .filter(|(name, _)| {
-                let text = name.to_string_lossy();
-                !text.is_empty() && !text.contains('=') && !text.contains('\0')
-            })
-            .map(|(key, value)| (key.to_string_lossy().to_ascii_uppercase(), (key, value)))
-            .collect();
-        for name in ["NODE_OPTIONS", "NODE_PATH"] {
-            environment.remove(name);
-        }
-        let mut set = |name: &str, value: OsString| {
-            environment.insert(name.to_ascii_uppercase(), (OsString::from(name), value));
-        };
-        set(
-            "JOUZU_HOME",
-            self.config.runtime_home.as_os_str().to_os_string(),
-        );
-        set("JOUZU_NO_UPDATE", OsString::from("1"));
-        set("PI_SKIP_VERSION_CHECK", OsString::from("1"));
-        set("JOUZU_TEXTGUARD_DESKTOP", OsString::from("1"));
-        set("JOUZU_HOST_SESSION_ID", OsString::from(&self.id));
-        if let Some(bash) = &self.config.bash {
-            set("JOUZU_LAUNCHER_BASH", bash.as_os_str().to_os_string());
-        }
-        if let Some(path) = self
+        let path = self
             .session_path
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        {
-            set("JOUZU_SESSION_PATH", OsString::from(path));
-        }
-        for (key, value) in &self.config.spec.env {
-            set(key, OsString::from(value));
-        }
-        environment.into_values().collect()
+            .clone();
+        self.config.environment(Some(&self.id), path.as_deref())
     }
 
     fn handle_runtime_event(self: &Arc<Self>, event: RuntimeEvent) {
@@ -3003,6 +4443,9 @@ impl Session {
                     "runtime.exited",
                     json!({ "code": code }),
                 );
+                // Commands still open went down with the runtime: none of them
+                // will answer, and none of their effects can be assumed.
+                self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
                 if !matches!(self.status(), Status::Stopped) {
                     let status = self.status();
                     let finalize = self.turn_running.load(Ordering::SeqCst)
@@ -3020,24 +4463,8 @@ impl Session {
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .take();
                         if let Some(turn) = turn.clone() {
-                            let text = std::mem::take(
-                                &mut *self
-                                    .assistant_text
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                            );
-                            let blocks = self.take_assistant_blocks(&text);
-                            if !text.is_empty() || blocks.as_array().is_some_and(|items| !items.is_empty()) {
-                                self.push_history(json!({
-                                    "kind": "assistant",
-                                    "id": format!("{turn}:assistant"),
-                                    "turnId": turn,
-                                    "text": text,
-                                    "blocks": blocks,
-                                    "createdAt": Self::now_iso(),
-                                    "interrupted": true,
-                                }));
-                            }
+                            self.finish_step_reply(&turn, None, true);
+                            self.close_unfinished_tools();
                         }
                         let client_id = self
                             .active_client_message
@@ -3074,6 +4501,21 @@ impl Session {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                         self.queue_paused.store(true, Ordering::SeqCst);
+                        self.prompt_echo.store(false, Ordering::SeqCst);
+                        self.steers_in_flight.store(0, Ordering::SeqCst);
+                        self.reclaim_waiting.store(false, Ordering::SeqCst);
+                        // The runtime's own queue went with it.
+                        for item in self
+                            .queued_turns
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .iter_mut()
+                        {
+                            item.steered = None;
+                            // Whatever an extension held went down with the runtime too;
+                            // the paused queue gives it back to the user.
+                            item.held = false;
+                        }
                         if let Some(turn) = turn {
                             self.publish(
                                 "turn.end",
@@ -3111,10 +4553,48 @@ pub struct SessionManager {
     runtime_home: PathBuf,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     clients: Mutex<HashMap<String, Vec<String>>>,
+    /// What each client connected to the global event stream has open. A
+    /// client opens one session at a time; that session is never reaped while
+    /// the client's stream is connected. Other idle sessions are, so a window
+    /// left open does not keep a runtime alive for every session it visited.
+    holders: Mutex<HashMap<String, Holder>>,
     persisted_cache: Mutex<Option<Vec<Value>>>,
 }
 
+#[derive(Default)]
+struct Holder {
+    streams: usize,
+    session: Option<String>,
+}
+
+/// One connected global stream. Dropping it releases the client's hold once
+/// its last stream closes.
+pub struct ClientStream {
+    manager: Arc<SessionManager>,
+    client_id: String,
+}
+
+impl Drop for ClientStream {
+    fn drop(&mut self) {
+        let mut holders = self
+            .manager
+            .holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Keep what the client had open: a stream that reconnects picks its
+        // hold up again. With no stream connected it protects nothing.
+        if let Some(holder) = holders.get_mut(&self.client_id) {
+            holder.streams = holder.streams.saturating_sub(1);
+        }
+    }
+}
+
 impl SessionManager {
+    /// The host home: host.json, host.log.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
     pub fn new(
         spec: Option<RuntimeSpec>,
         home: PathBuf,
@@ -3130,6 +4610,7 @@ impl SessionManager {
             bash,
             replay_limit,
             events,
+            warm: Arc::new(std::sync::OnceLock::new()),
         });
         Self {
             config,
@@ -3137,6 +4618,7 @@ impl SessionManager {
             runtime_home,
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            holders: Mutex::new(HashMap::new()),
             persisted_cache: Mutex::new(None),
         }
     }
@@ -3322,21 +4804,8 @@ impl SessionManager {
         limit: Option<usize>,
     ) -> Result<Vec<Value>, ApiError> {
         let path = self.session_file(session_path)?;
-        let file = std::fs::File::open(path)
+        let mut messages = saved_messages(&path)
             .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
-        let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
-        let mut messages = Vec::new();
-        for line in std::io::BufRead::lines(reader) {
-            let Ok(line) = line else { break };
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if value.get("type").and_then(Value::as_str) == Some("message") {
-                if let Some(message) = value.get("message") {
-                    messages.push(message.clone());
-                }
-            }
-        }
         if let Some(limit) = limit {
             if messages.len() > limit {
                 messages.drain(..messages.len() - limit);
@@ -3466,6 +4935,7 @@ impl SessionManager {
             "bash": self.home.join("runtime").join("git").join("bin").join("bash.exe").is_file(),
             "git": self.home.join("runtime").join("git").exists(),
             "terminal": self.home.join("runtime").join("terminal").exists(),
+            "warmRuntime": self.warm_runtime().map(|pool| pool.status()),
         })
     }
 
@@ -3551,7 +5021,20 @@ impl SessionManager {
         Ok(workspaces)
     }
 
+    /// Pins, archives and titles by session, keyed in one form (`canonical_path`)
+    /// whatever form the file stores them in.
     fn read_preferences(&self) -> HashMap<String, SessionPreference> {
+        self.stored_preferences()
+            .into_iter()
+            .map(|(key, preference)| (canonical_path(&key), preference))
+            .collect()
+    }
+
+    /// The file as stored. Its keys are what `std::fs::canonicalize` gives (on
+    /// Windows `\\?\C:\…`): the launcher before the host wrote them that way and
+    /// still reads them that way, and the file is shared with it across the
+    /// stable and QA channels. So entries keep their stored key.
+    fn stored_preferences(&self) -> HashMap<String, SessionPreference> {
         let Ok(bytes) = std::fs::read(self.preferences_path()) else {
             return HashMap::new();
         };
@@ -3596,9 +5079,16 @@ impl SessionManager {
             return Err(ApiError::bad_request("Unknown session path"));
         }
         let key = canonical_path(&path.to_string_lossy());
-        let mut preferences = self.read_preferences();
+        let mut preferences = self.stored_preferences();
+        // Update the entry already stored for this session, in whatever form its
+        // key was written; a new one is stored in the launcher's form.
+        let stored = preferences
+            .keys()
+            .find(|stored| canonical_path(stored) == key)
+            .cloned()
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let (pinned, archived, title) = {
-            let preference = preferences.entry(key.clone()).or_default();
+            let preference = preferences.entry(stored).or_default();
             if let Some(value) = pinned {
                 preference.pinned = value;
             }
@@ -3662,17 +5152,27 @@ impl SessionManager {
     /// metadata-only: it never starts a runtime and never returns transcript
     /// bodies.
     pub fn reap_idle(&self, ttl: Duration) {
+        let held: Vec<String> = self
+            .holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|holder| holder.streams > 0)
+            .filter_map(|holder| holder.session.clone())
+            .collect();
         let mut sessions = self
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let stale: Vec<String> = sessions
             .iter()
-            .filter(|(_, session)| {
+            .filter(|(id, session)| {
                 let idle = session.status() == Status::Idle
                     && session.subscriber_count() == 0
+                    && !held.contains(id)
                     && session.last_activity().elapsed() >= ttl;
                 let pending = session.status() == Status::Pending
+                    && !held.contains(id)
                     && session.last_activity().elapsed() >= ttl;
                 idle || pending
             })
@@ -3750,6 +5250,7 @@ impl SessionManager {
                 if is_scratch_workspace(&cwd) {
                     return None;
                 }
+
                 let normalized = cwd
                     .replace('\\', "/")
                     .trim_start_matches("//?/")
@@ -3758,6 +5259,10 @@ impl SessionManager {
                 let _ = normalized;
                 let key = canonical_path(&path.to_string_lossy());
                 let preference = preferences.get(&key);
+                // Nobody has written in it yet: a warm runtime's own file, or a new
+                // session never used. Kept for the folder spelling, never listed.
+                let blank = title.is_none()
+                    && preference.and_then(|preference| preference.title.as_ref()).is_none();
                 let title = preference
                     .and_then(|preference| preference.title.clone())
                     .unwrap_or_else(|| {
@@ -3785,13 +5290,36 @@ impl SessionManager {
                     "running": false,
                     "pinned": preference.map(|value| value.pinned).unwrap_or(false),
                     "archived": preference.map(|value| value.archived).unwrap_or(false),
+                    "blank": blank,
                 }))
             })
-            .take(300)
+            // Blank files never count toward the list's limit.
+            .scan(0usize, |listed, entry| {
+                if entry.get("blank").and_then(Value::as_bool) != Some(true) {
+                    *listed += 1;
+                }
+                Some((*listed <= 300).then_some(entry))
+            })
+            .flatten()
             .collect()
     }
 
+    /// Saved conversations, most recent first (at most 300).
     pub fn persisted(&self, workspace: Option<&str>, refresh: bool) -> Vec<Value> {
+        self.persisted_files(workspace, refresh)
+            .into_iter()
+            .filter(|entry| entry.get("blank").and_then(Value::as_bool) != Some(true))
+            .map(|mut entry| {
+                if let Some(object) = entry.as_object_mut() {
+                    object.remove("blank");
+                }
+                entry
+            })
+            .collect()
+    }
+
+    /// Every saved session file, blank ones included.
+    fn persisted_files(&self, workspace: Option<&str>, refresh: bool) -> Vec<Value> {
         let entries = {
             let mut cache = self
                 .persisted_cache
@@ -3839,6 +5367,42 @@ impl SessionManager {
                 entry.push(capability.clone());
             }
         }
+    }
+
+    /// A client's global stream is open; keep what it holds until it closes.
+    pub fn connect_client(self: &Arc<Self>, client_id: &str) -> ClientStream {
+        self.holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(client_id.to_string())
+            .or_default()
+            .streams += 1;
+        ClientStream {
+            manager: Arc::clone(self),
+            client_id: client_id.to_string(),
+        }
+    }
+
+    /// The client opened or used this session; it replaces what it held.
+    /// Only a client with a connected stream holds anything.
+    pub fn hold(&self, client_id: &str, session_id: &str) {
+        if let Some(holder) = self
+            .holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(client_id)
+        {
+            holder.session = Some(session_id.to_string());
+        }
+    }
+
+    /// The session this client shows now, if it has a connected stream.
+    pub fn viewing(&self, client_id: &str) -> Option<String> {
+        self.holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(client_id)
+            .and_then(|holder| holder.session.clone())
     }
 
     pub fn client_can_prompt(&self, client_id: &str) -> bool {
@@ -3944,7 +5508,14 @@ impl SessionManager {
         key: Option<String>,
         status: Status,
     ) -> Result<Arc<Session>, ApiError> {
-        let workspace = std::fs::canonicalize(workspace)
+        // A saved conversation belongs to the folder its file names, whatever
+        // folder the client happens to be showing: the runtime works there and
+        // the sidebar must file it there.
+        let workspace = session_path
+            .as_deref()
+            .and_then(session_header_cwd)
+            .unwrap_or_else(|| workspace.to_string());
+        let workspace = std::fs::canonicalize(&workspace)
             .map_err(|_| ApiError::bad_request("workspacePath is unavailable"))?;
         if !workspace.is_dir() {
             return Err(ApiError::bad_request("workspacePath must be a folder"));
@@ -3971,6 +5542,38 @@ impl SessionManager {
                     .clone();
                 current.is_some_and(|current| same_session_file(&current, requested))
             };
+            // A different file carrying the same conversation (a copy) cannot be
+            // open twice: the runtime refuses the second owner after loading for
+            // seconds. Say so at once instead.
+            if let Some(requested_id) = session_path.as_deref().and_then(session_header_id) {
+                let twin = sessions.values().find(|session| {
+                    if same_file(session)
+                        || matches!(session.status(), Status::Stopped | Status::Cancelled | Status::Error)
+                    {
+                        return false;
+                    }
+                    let path = session
+                        .session_path
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    path.and_then(|path| session_header_id(&path)).as_deref() == Some(requested_id.as_str())
+                });
+                if let Some(twin) = twin {
+                    let other = twin
+                        .session_path
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                        .unwrap_or_default();
+                    return Err(ApiError::new(
+                        axum::http::StatusCode::CONFLICT,
+                        "session-open-elsewhere",
+                        format!("This conversation is already open from another file ({other}). Close that one first."),
+                        false,
+                    ));
+                }
+            }
             if let Some(existing) = sessions
                 .values()
                 .find(|session| session.key == key || same_file(session))
@@ -3986,10 +5589,21 @@ impl SessionManager {
             }
         }
         let config = self.config.clone().ok_or_else(|| {
+            // Without a `--runtime`, the host runs the bundled Node and app; say
+            // which one is missing rather than falling back to anything else.
+            let managed = self.runtime_home.parent().unwrap_or(&self.home);
+            let node = managed.join("runtime").join("node").join("node.exe");
+            let message = if !node.is_file() {
+                format!("Jouzu's bundled Node.js is missing ({}). Reinstall Jouzu to restore it.", node.display())
+            } else {
+                "Jouzu's bundled runtime is missing. Reinstall Jouzu to restore it.".to_string()
+            };
             ApiError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "runtime-unavailable",
-                "No runtime is configured for the host",
+                // Not retryable, and not the generic "try again" text: the
+                // message says what is missing.
+                "runtime-missing",
+                message,
                 false,
             )
         })?;
@@ -3997,6 +5611,7 @@ impl SessionManager {
         // A new session gets its identity at creation, not after the runtime
         // handshake. The index and navigation can then show it before the first
         // reply, including when the turn is stopped during starting.
+        let fresh = session_path.is_none();
         let session_path = match session_path {
             Some(path) => Some(path),
             None if matches!(status, Status::Pending) => {
@@ -4008,7 +5623,7 @@ impl SessionManager {
                     "version": 3,
                     "id": random_id(),
                     "timestamp": Session::now_iso(),
-                    "cwd": workspace.to_string_lossy(),
+                    "cwd": self.folder_text(&workspace),
                 });
                 if std::fs::write(&file, format!("{header}\n")).is_ok() {
                     Some(file.to_string_lossy().into_owned())
@@ -4030,6 +5645,7 @@ impl SessionManager {
             status,
             &config,
         );
+        session.fresh.store(fresh, Ordering::SeqCst);
         {
             let mut sessions = self
                 .sessions
@@ -4038,13 +5654,85 @@ impl SessionManager {
             sessions.insert(session.id.clone(), session.clone());
         }
         if matches!(status, Status::Starting) {
+            // A saved conversation is readable the moment it is opened: its
+            // history comes from its file, not from the runtime that attaches
+            // to it seconds (or, on a busy machine, minutes) later.
+            session.open_saved_history();
             let starting = session.clone();
             tokio::spawn(async move { starting.start(false) });
+        } else if let Some(pool) = config.warm.get() {
+            // A new session: the user is typing; warm for its folder meanwhile.
+            pool.aim(Path::new(&session.runtime_cwd()));
+            pool.hurry();
         }
         Ok(session)
     }
 
+    /// Keep one runtime started ahead of need. Called once by the host binary;
+    /// tests opt in explicitly.
+    pub fn enable_warm_runtime(&self) -> Option<Arc<WarmPool>> {
+        let config = self.config.clone()?;
+        let scratch = WarmPool::scratch(&config.home);
+        let events = config.events.clone();
+        let spawn = config.clone();
+        let memory = config.home.join("warm-workspace.txt");
+        let log_home = config.home.clone();
+        let pool = config.warm.get_or_init(|| {
+            WarmPool::new(
+                move |workspace| SpawnSpec {
+                    program: spawn.spec.program.clone(),
+                    args: spawn.spec.args.clone(),
+                    env: spawn.environment(None, None),
+                    workspace: workspace.map(Path::to_path_buf).unwrap_or_else(|| scratch.clone()),
+                    low_priority: true,
+                },
+                Some(memory),
+                move |status| {
+                    // Each state change, so a slow or failed warm-up can be traced.
+                    log(&log_home, "info", "runtime.warm", status.clone());
+                    if let Some(events) = &events {
+                        events.publish_control("runtime.warm", status);
+                    }
+                },
+            )
+        });
+        pool.fill();
+        log(&config.home, "info", "runtime.warm_start", pool.status());
+        // The app is starting and its loading screen waits for this runtime.
+        pool.hurry();
+        Some(pool.clone())
+    }
+
+    /// How to spell `workspace` for a runtime and a new session header. Pi
+    /// treats `\\?\C:\x` and `C:\x` as two folders, and a runtime switched across
+    /// them loads every extension again. A folder keeps the spelling it already
+    /// has: the warm runtime's, else its latest session's, else the plain form.
+    pub fn folder_text(&self, workspace: &Path) -> String {
+        if let Some(pool) = self.warm_runtime() {
+            if let Some(known) = pool.folders().into_iter().find(|folder| same_place(folder, workspace)) {
+                return known.to_string_lossy().into_owned();
+            }
+        }
+        let plain = canonical_path(&workspace.to_string_lossy());
+        let latest = self
+            .persisted_files(Some(&plain), false)
+            .into_iter()
+            .filter_map(|entry| entry.get("sessionPath").and_then(Value::as_str).map(str::to_string))
+            .find_map(|path| session_header_cwd(&path));
+        match latest {
+            Some(text) if same_place(Path::new(&text), workspace) => text,
+            _ => plain,
+        }
+    }
+
+    pub fn warm_runtime(&self) -> Option<Arc<WarmPool>> {
+        self.config.as_ref().and_then(|config| config.warm.get().cloned())
+    }
+
     pub fn stop_all(&self) {
+        if let Some(pool) = self.warm_runtime() {
+            pool.stop();
+        }
         let sessions: Vec<Arc<Session>> = self
             .sessions
             .lock()
@@ -4082,6 +5770,9 @@ pub struct CreateRequest {
     #[serde(rename = "sessionPath")]
     pub session_path: Option<String>,
     pub key: Option<String>,
+    /// The client opening the session; it holds the session (see `hold`).
+    #[serde(rename = "clientId", default)]
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

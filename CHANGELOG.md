@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.0 - 2026-11-15
+
+First release on the QA channel (Settings → System). It shares your data and sign-ins with
+the stable channel, and you can switch back at any time.
+
+- Chat sessions now run through a local host that keeps them alive on its own: closing or
+  reloading the window no longer stops a reply, and a window that reconnects catches up.
+- Startup keeps a few recent folders ready, so opening a session there does not wait for
+  the model runtime to start.
+- Messages sent while a reply is running wait in a visible queue and are delivered once, at
+  the next step; Stop keeps them so you can continue or discard them.
+- Saved conversations open on the model they last used.
+- Session problems are shown in one place above the message box, with what to do next;
+  there are no more floating notices.
+- If the model runtime stops during a reply, the session recovers by itself and the
+  unanswered message offers Retry. Flow control no longer shows "holding" after it has
+  released.
+- A missing bundled Node.js is reported instead of silently using another one.
+
 ## 1.0.23 - 2026-11-09
 
 - Restore the session open path to the 2570a2d behaviour: a 4 MB tail preview
