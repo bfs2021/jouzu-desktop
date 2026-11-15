@@ -8,9 +8,10 @@ Jouzu Desktop has two update feeds:
 | QA | `releases/download/desktop-update-qa/latest.json` | Installations switched to QA in Settings → System |
 
 The installed package and the update channel are independent. The channel is a setting
-(`update-channel.json` in the managed root); a missing or unreadable setting means stable,
-whatever package was installed. Switching it changes only which feed the app updates from;
-the install folder, data and sign-ins stay the same.
+(`update-channel.json` in the Desktop folder, `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop`); a
+missing or unreadable setting means stable, whatever package was installed. Switching it
+changes only which feed the app updates from; the install folder, Jouzu's data and sign-ins
+stay the same.
 
 ## Packages
 
@@ -54,6 +55,6 @@ is built.
   reaches it too.
 - Switching back to stable offers the current stable build even when it is older, marked as
   going back; nothing installs until the user asks.
-- Because QA shares the user's data, a QA build must not change stored data in a way the
-  current stable cannot read. A data format change ships with a version marker and stays
-  readable by stable, or it waits.
+- Because QA and stable share the user's Jouzu home (which `jz` uses too), a QA build must not
+  change stored data in a way the current stable cannot read. A data format change ships with
+  a version marker and stays readable by stable, or it waits.
