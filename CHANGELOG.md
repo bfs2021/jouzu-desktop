@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.2 - 2026-11-15
+
+QA channel fixes.
+
+- The first start after an update no longer stays on "Connecting to launcher…" when a new
+  model catalog is activated while the last session opens (#73).
+- Language settings can be saved again, in Settings and on the first-run language page (#72).
+- A QA installation shows the Jouzu icon with a "QA" badge on the window, taskbar, tray and
+  shortcuts, and switches back when you return to stable (#74).
+- A turn's "files edited" list appears only under that turn of the session that made it, not
+  under other sessions or earlier turns (#79).
+- The README and public documentation describe the current design.
+
 ## 1.1.1 - 2026-11-15
 
 QA channel fixes.
