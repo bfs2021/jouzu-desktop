@@ -25,6 +25,7 @@ import {
   type SessionStats,
   type TurnStep,
 } from "./chat-types";
+import { newId } from "./secure-context";
 
 export interface SessionPort {
   readonly id: string;
@@ -360,7 +361,7 @@ export class SessionStore {
    * the outbox, and on screen, before the request leaves; the host's receipt
    * turns it into a transcript row. A failure keeps it as "not sent".
    */
-  async send(messageText: string, images: readonly ChatImage[] = [], clientMessageId: string = crypto.randomUUID()): Promise<Receipt> {
+  async send(messageText: string, images: readonly ChatImage[] = [], clientMessageId: string = newId()): Promise<Receipt> {
     const existing = this.state.outbox?.find(item => item.clientMessageId === clientMessageId);
     const item: OutboxItem = existing
       ? { ...existing, state: "sending", error: undefined }
@@ -468,7 +469,7 @@ export class SessionStore {
 
   async runCommand(command: string): Promise<void> {
     if (this.running) throw new Error("Wait for the current turn to finish before running a command.");
-    await this.session.send({ clientMessageId: crypto.randomUUID(), text: command });
+    await this.session.send({ clientMessageId: newId(), text: command });
   }
 
   /** TextGuard's three modes; the runtime's reply confirms the mode shown. */

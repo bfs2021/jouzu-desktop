@@ -43,6 +43,7 @@ import { Progress } from "./components/ui/progress";
 import { catalogReview, messages, locales, resolveLocale, type Locale } from "./i18n";
 import { type Workspace } from "./history";
 import { parseDiagnostics, type Diagnostics } from "./diagnostics";
+import { copyText } from "./secure-context";
 interface LauncherState { platform: "windows" | "macos" | "linux"; recent: Workspace[]; ready: boolean; bash: boolean; bundled_git: boolean }
 interface Components { jouzu: string | null; development: boolean; launcherUpdaterConfigured?: boolean; jouzuUpdaterConfigured?: boolean; build?: string; commit?: string }
 interface RuntimeReport { status?: string; version: string | null; expectedVersion?: string; versionCurrent?: boolean; minimumVersion?: string; verifiedVersions?: string[]; mandatory?: boolean; root: string | null; app: string | null; node: boolean; nodeVersion: string | null; nodeCurrent: boolean; git: boolean; terminal: boolean }
@@ -321,8 +322,7 @@ export function App() {
   async function copyStatusError(text = statusError) {
     if (!text) return;
     try {
-      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
-      else { const area = document.createElement("textarea"); area.value = text; area.style.position = "fixed"; area.style.opacity = "0"; document.body.appendChild(area); area.select(); document.execCommand("copy"); area.remove(); }
+      await copyText(text);
       setStatusCopied(true); setTimeout(() => setStatusCopied(false), 2000);
     } catch (error) { quiet(error); }
   }

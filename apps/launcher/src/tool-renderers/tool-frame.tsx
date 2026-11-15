@@ -1,5 +1,6 @@
 import { createContext, useContext, useId, useState, type ReactNode } from "react";
 import { Check, ChevronDown, Copy } from "lucide-react";
+import { copyText as copyToClipboard } from "../secure-context";
 
 /** Chips render the same body without a second header/border. */
 export const ToolDetailContext = createContext(false);
@@ -100,7 +101,7 @@ export function ToolSection({ label, copyText, children, maxHeight = "max-h-96" 
         className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-muted hover:text-foreground"
         onClick={async () => {
           try {
-            await navigator.clipboard.writeText(copyText);
+            await copyToClipboard(copyText);
             setCopied(true);
             window.setTimeout(() => setCopied(false), 1200);
           } catch {

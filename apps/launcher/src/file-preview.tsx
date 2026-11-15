@@ -4,6 +4,7 @@ import { FileText, FolderOpen } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { ChatMarkdown } from "./chat-markdown";
 import { ErrorLine } from "./session-alerts-view";
+import { copyText } from "./secure-context";
 
 interface Preview {
   binary: boolean;
@@ -56,7 +57,7 @@ export function FilePreview({ path, workspace, onClose }: { path: string; worksp
   }
 
   async function copyPath() {
-    try { await navigator.clipboard.writeText(path); } catch { /* Clipboard may be unavailable. */ }
+    try { await copyText(path); } catch { /* Clipboard may be unavailable. */ }
   }
 
   const name = fileName(path);

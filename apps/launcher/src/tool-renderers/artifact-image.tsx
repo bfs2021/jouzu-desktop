@@ -5,6 +5,7 @@ import { Check, Copy, Download, FolderOpen, Maximize2, Quote } from "lucide-reac
 import { Button } from "../components/ui/button";
 import { ImageViewer, type ViewerAction } from "../components/image-viewer";
 import { MAX_TOOL_IMAGE_BYTES, MessageImage } from "../message-image";
+import { copyText } from "../secure-context";
 
 export interface ArtifactImageData {
   mime: string;
@@ -64,7 +65,7 @@ export function ArtifactImage({ image, caption, onUse }: { image: ArtifactImageD
       id: "copy",
       label: copied ? "Path copied" : "Copy path",
       icon: copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />,
-      onSelect: () => { void navigator.clipboard.writeText(image.path!).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }).catch(() => setCopied(false)); },
+      onSelect: () => { void copyText(image.path!).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }).catch(() => setCopied(false)); },
     });
     actions.push({ id: "reveal", label: "Show in folder", icon: <FolderOpen className="size-3.5" />, onSelect: () => { void invoke("reveal_path", { path: image.path }).catch(() => {}); } });
     actions.push({

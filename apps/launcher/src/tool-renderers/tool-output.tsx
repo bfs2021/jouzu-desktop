@@ -8,6 +8,7 @@ import { record, toolText } from "./types";
 import { ArtifactImage } from "./artifact-image";
 import { artifactPathFromText } from "./artifact-path";
 import { RevealPath } from "../reveal-path";
+import { copyText } from "../secure-context";
 
 const MAX_LINES = 2000;
 export const MAX_TOOL_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -53,7 +54,7 @@ function AnsiPre({ text, expanded = false }: { text: string; expanded?: boolean 
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
-  return <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={async () => { try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1200); } catch { setCopied(false); } }}>{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? "Copied" : "Copy"}</Button>;
+  return <Button variant="ghost" className="h-7 gap-1 px-2 text-[11px]" onClick={async () => { try { await copyText(text); setCopied(true); setTimeout(() => setCopied(false), 1200); } catch { setCopied(false); } }}>{copied ? <Check className="size-3" /> : <Copy className="size-3" />}{copied ? "Copied" : "Copy"}</Button>;
 }
 
 function DownloadButton({ text }: { text: string }) {

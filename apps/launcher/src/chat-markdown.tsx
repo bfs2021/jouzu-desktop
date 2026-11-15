@@ -6,6 +6,7 @@ import "highlight.js/styles/github-dark.css";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "./components/ui/button";
 import { MessageImage } from "./message-image";
+import { copyText } from "./secure-context";
 
 function nodeText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -23,7 +24,7 @@ function Code({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
     <div className="flex items-center justify-between border-b border-border bg-muted px-2">
       <span className="px-1 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">{language}</span>
       <Button variant="ghost" className="h-8 text-xs" onClick={async () => {
-        try { await navigator.clipboard.writeText(text); setStatus("Copied"); }
+        try { await copyText(text); setStatus("Copied"); }
         catch { setStatus("Copy failed"); }
       }}>{status || "Copy code"}</Button>
     </div>

@@ -4,6 +4,7 @@ import { Button } from "./components/ui/button";
 import { StatCard, StatPopover, StatRow } from "./components/stat-popover";
 import type { ChatMessage } from "./chat-projection";
 import { providerLabel } from "./provider-label";
+import { copyText } from "./secure-context";
 
 function compact(value: number) {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
@@ -35,7 +36,7 @@ export function TurnFooter({ message, usage, startedAt, onFork, forkDisabled = f
   if (!text) return null;
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch { /* Clipboard unavailable; leave the transcript unchanged. */ }

@@ -31,6 +31,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import type { TextGuardMode } from "./session-notices";
 import { opensLive } from "./session-open";
 import { useWarmRuntime, warmBlocks, type WarmView } from "./warm-runtime";
+import { newId, copyText } from "./secure-context";
 
 /** The side pane starts at half the window so chat and pane have equal room. */
 function defaultPaneWidth() {
@@ -509,8 +510,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   async function copySessionId(session: SessionSummary) {
     const id = session.path.split(/[\\/]/u).at(-1)?.replace(/\.jsonl$/u, "") ?? session.path;
     try {
-      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(id);
-      else { const area = document.createElement("textarea"); area.value = id; area.style.position = "fixed"; area.style.opacity = "0"; document.body.appendChild(area); area.select(); document.execCommand("copy"); area.remove(); }
+      await copyText(id);
       setSidebarNote(null);
       setCopied(session.path);
     } catch (error) { setSidebarNote(explainError(error, "Could not copy the session ID.")); setSessionMenu(null); }
@@ -719,7 +719,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     // only a session with a transcript is keyed by path; an unstored one is closed
     // unless it is still working.
     if (sessionFile && previous.snapshot.projection.messages.length) chatPool.remember(sessionFile, previous);
-    else if (previous.snapshot.projection.running || previous.snapshot.pending) chatPool.remember(`unsaved:${crypto.randomUUID()}`, previous);
+    else if (previous.snapshot.projection.running || previous.snapshot.pending) chatPool.remember(`unsaved:${newId()}`, previous);
     else void previous.close().catch(() => {});
   }
   function queueNewSession() {

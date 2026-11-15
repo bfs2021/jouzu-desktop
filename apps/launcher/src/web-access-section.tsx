@@ -11,6 +11,7 @@ import { Label } from "./components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select";
 import { Switch } from "./components/ui/switch";
 import { ErrorLine } from "./session-alerts-view";
+import { copyText } from "./secure-context";
 
 interface Text {
   title: string; hint: string; scope: string;
@@ -188,7 +189,7 @@ export function WebAccessSection({ locale, openUrl, confirm }: { locale: Locale;
               <p className="text-sm font-medium">{link.network}</p>
               <Input readOnly aria-label={link.network} value={link.url} onFocus={event => event.target.select()} />
               <div className="flex flex-wrap justify-end gap-2">
-                <Button variant="outline" onClick={() => void navigator.clipboard.writeText(link.url).then(() => setCopied(link.url)).catch(failure => setError(failure))}><Copy />{copied === link.url ? t.copied : t.copy}</Button>
+                <Button variant="outline" onClick={() => void copyText(link.url).then(() => setCopied(link.url)).catch(failure => setError(failure))}><Copy />{copied === link.url ? t.copied : t.copy}</Button>
                 {new URL(link.url).hostname === "127.0.0.1" && <Button variant="outline" onClick={() => void openUrl(link.url).catch(failure => setError(failure))}><ArrowUpRight />{t.open}</Button>}
               </div>
             </div>

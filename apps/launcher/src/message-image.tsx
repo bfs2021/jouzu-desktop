@@ -5,6 +5,7 @@ import { Check, Copy, ExternalLink, FolderOpen, ImageOff } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { JouzuLoader } from "./components/ui/jouzu-loader";
 import { useWorkspaceRoot } from "./workspace-context";
+import { copyText } from "./secure-context";
 
 /** The native reader's cap for a workspace file. */
 export const MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -305,7 +306,7 @@ function CopyPathButton({ path }: { path: string }) {
   const [copied, setCopied] = useState(false);
   return <Button variant="ghost" className={CARD_ACTION} onClick={async () => {
     try {
-      await navigator.clipboard.writeText(path);
+      await copyText(path);
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
     } catch {

@@ -6,13 +6,14 @@
  * consumes the normalized events the host publishes.
  */
 import type { ApiEvent, HistoryPage, JouzuApi, OutgoingMessage, Receipt, SessionHandle } from "./jouzu-api";
+import { newId } from "../secure-context";
 
 let clientSequence = 0;
 
 /** One identity per page load so a reconnect resumes instead of duplicating. */
 export function newClientId(): string {
   clientSequence += 1;
-  return `desktop-${globalThis.crypto.randomUUID().slice(0, 8)}-${clientSequence}`;
+  return `desktop-${newId().slice(0, 8)}-${clientSequence}`;
 }
 
 export class HostChatSession {

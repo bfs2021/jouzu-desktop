@@ -1,8 +1,9 @@
 import type { ChatProjection } from "./chat-projection";
 import type { TextGuardMode } from "./session-notices";
+import { newId } from "./secure-context";
 
 /** One id per page load: handles from an older page are released by the host. */
-export const pageGeneration = globalThis.crypto.randomUUID();
+export const pageGeneration = newId();
 
 export interface ChatImage { type: "image"; data: string; mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif" }
 export interface ChatModel {

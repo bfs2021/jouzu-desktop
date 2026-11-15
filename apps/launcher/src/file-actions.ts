@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { copyText } from "./secure-context";
 
 /**
  * File actions for paths that appear in the transcript (0057). Revealing is a
@@ -43,7 +44,7 @@ export async function revealPath(path: string, workspace?: string): Promise<void
 
 export async function copyPath(path: string): Promise<boolean> {
   try {
-    await navigator.clipboard.writeText(path);
+    await copyText(path);
     return true;
   } catch {
     return false;
