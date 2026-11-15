@@ -25,6 +25,22 @@ async function failure(response) {
 export default {
   id: "shisa",
   label: "Shisa.AI",
+  signInHint: "Sign in to Shisa.AI or set SHISA_API_KEY to generate images.",
+
+  /**
+   * Jouzu's own rule for the Shisa credential, as its voice input and catalog
+   * use it: a local sign-out suppresses every credential, then SHISA_API_KEY,
+   * then an unexpired `/login shisa` sign-in. An expired sign-in is no credential.
+   */
+  async credential({ env, agentDir, runtimeModule }) {
+    const { isShisaSignedOut, readShisaLoginToken } = await runtimeModule("jouzu/dist/shisa-link/credentials.js");
+    const paths = { agentDir };
+    if (isShisaSignedOut(paths)) return undefined;
+    const key = env.SHISA_API_KEY?.trim();
+    if (key) return { type: "api_key", key };
+    const access = readShisaLoginToken(paths);
+    return access ? { type: "oauth", access } : undefined;
+  },
 
   /** The sizes this model accepts; unknown models keep the full set. */
   sizes(model) {
@@ -32,9 +48,12 @@ export default {
   },
 
   async listModels(token) {
+    // Shorter than the desktop's 20 s wait for the Tools page answer.
     const response = await fetch(`${BASE}/models`, {
       headers: { authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(15_000),
+    }).catch(() => {
+      throw new Error("Shisa.AI could not be reached.");
     });
     if (!response.ok) throw new Error(await failure(response));
     const body = await response.json().catch(() => null);

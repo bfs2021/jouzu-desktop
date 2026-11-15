@@ -250,7 +250,8 @@ export interface ModelApi {
 export interface ToolsApi {
   settings(): Promise<{ path: string; exists: boolean; settings: Record<string, unknown> }>;
   save(image: Record<string, unknown>): Promise<Record<string, unknown>>;
-  providers(): Promise<{ providers: Array<{ id: string; label: string }> }>;
+  /** Each provider says whether it can generate images now, and why not; `models` comes with a usable one. */
+  providers(): Promise<{ providers: Array<{ id: string; label: string; available?: boolean; reason?: string; models?: unknown }> }>;
   models(provider: string): Promise<{ models: unknown }>;
 }
 
