@@ -1016,6 +1016,8 @@ async fn control_request(
     // start; an unused warm runtime would still have the old ones.
     if !reads_only && result.is_ok() {
         recycle_warm_runtime(&state);
+        // The model list depends on the same settings (#84).
+        state.models.invalidate();
     }
     result.map(Json)
 }
@@ -1385,6 +1387,8 @@ async fn save_environment(
 ) -> Result<Json<Value>, ApiError> {
     environment::save(state.sessions.runtime_home(), &entries).map_err(ApiError::bad_request)?;
     recycle_warm_runtime(&state);
+    // A saved key (SHISA_API_KEY, a provider key) changes which models are usable (#84).
+    state.models.invalidate();
     Ok(Json(json!({ "entries": entries })))
 }
 
