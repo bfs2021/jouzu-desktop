@@ -1403,36 +1403,58 @@ async fn tools_snapshot(State(state): State<AppState>) -> Json<Value> {
     let value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .unwrap_or_else(|| json!({ "reviewTools": ["generate_image"] }));
+        .unwrap_or_else(|| json!({}));
     Json(json!({
         "path": path.to_string_lossy(),
         "exists": path.is_file(),
-        "settings": value,
+        "settings": read_tools_settings(&value),
     }))
 }
 
-fn normalize_image_tool(value: &Value) -> Result<Value, ApiError> {
+/// The tools settings in the shape every reader can rely on, whatever the file
+/// holds: a missing file or section reads as the defaults the save path writes,
+/// and a value the save path would refuse reads as its default. An unset
+/// provider stays empty: which provider can be used is the image tool's answer.
+fn read_tools_settings(value: &Value) -> Value {
+    let image = value.get("image").unwrap_or(&Value::Null);
+    let provider = image
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let model = image
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| valid_image_model(model))
+        .unwrap_or("");
+    let review = value
+        .get("reviewTools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| tool.is_string())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .filter(|tools| !tools.is_empty())
+        .unwrap_or_else(|| vec![json!("generate_image")]);
+    json!({ "image": image_tool_fields(image, provider, model), "reviewTools": review })
+}
+
+fn valid_image_model(model: &str) -> bool {
+    model.len() <= 128
+        && model.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/')
+        })
+}
+
+/// The image settings with defaults for every field but the two the caller checked.
+fn image_tool_fields(value: &Value, provider: &str, model: &str) -> Value {
     let enabled = value
         .get("enabled")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let provider = value
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-        .ok_or_else(|| ApiError::bad_request("provider is required"))?;
-    let model = value
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if model.len() > 128
-        || !model
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/'))
-    {
-        return Err(ApiError::bad_request("model is invalid"));
-    }
     let size = value
         .get("size")
         .and_then(Value::as_str)
@@ -1443,13 +1465,30 @@ fn normalize_image_tool(value: &Value) -> Result<Value, ApiError> {
         .and_then(Value::as_u64)
         .map(|max| max.clamp(1, 10))
         .unwrap_or(3);
-    Ok(json!({
+    json!({
         "enabled": enabled,
         "provider": provider,
         "model": model,
         "size": size,
         "maxImages": max_images,
-    }))
+    })
+}
+
+fn normalize_image_tool(value: &Value) -> Result<Value, ApiError> {
+    let provider = value
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .ok_or_else(|| ApiError::bad_request("provider is required"))?;
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !valid_image_model(model) {
+        return Err(ApiError::bad_request("model is invalid"));
+    }
+    Ok(image_tool_fields(value, provider, model))
 }
 
 async fn update_tools(
@@ -3230,6 +3269,48 @@ mod session_tests {
         )
         .await;
         assert!(refreshed.2.contains("second.jsonl"), "{}", refreshed.2);
+    }
+
+    // #67: with no tools.json the Tools page still gets a full image section.
+    #[tokio::test]
+    async fn tools_read_fills_defaults_when_the_file_is_missing_or_partial() {
+        let (manager, home, _workspace) = manager(50);
+        let app = app(manager);
+        let missing = call(
+            app.clone(),
+            request(Method::GET, "/v1/tools")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(missing.0, StatusCode::OK, "{}", missing.2);
+        let body: Value = serde_json::from_str(&missing.2).unwrap();
+        assert_eq!(body["exists"], false);
+        assert_eq!(
+            body["settings"],
+            json!({ "image": { "enabled": true, "provider": "", "model": "", "size": "1K", "maxImages": 3 }, "reviewTools": ["generate_image"] })
+        );
+
+        let agent = home.path().join("data").join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            agent.join("tools.json"),
+            json!({ "image": { "enabled": false, "model": "bad model!", "size": "9K", "maxImages": 50 } })
+                .to_string(),
+        )
+        .unwrap();
+        let partial = call(
+            app,
+            request(Method::GET, "/v1/tools")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let body: Value = serde_json::from_str(&partial.2).unwrap();
+        assert_eq!(
+            body["settings"],
+            json!({ "image": { "enabled": false, "provider": "", "model": "", "size": "1K", "maxImages": 10 }, "reviewTools": ["generate_image"] })
+        );
     }
 
     #[tokio::test]

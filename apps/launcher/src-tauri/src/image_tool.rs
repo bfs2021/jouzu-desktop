@@ -15,6 +15,10 @@ const SHISA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../packaging/launcher/extensions/jouzu-image/providers/shisa.mjs"
 ));
+const RUNTIME_PROVIDERS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../packaging/launcher/extensions/jouzu-image/providers/runtime.mjs"
+));
 const ARTIFACTS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../packaging/launcher/extensions/jouzu-image/artifacts.mjs"
@@ -37,6 +41,7 @@ pub fn ensure(managed: &Path) -> Result<(), String> {
     std::fs::write(directory.join("package.json"), MANIFEST).map_err(|error| error.to_string())?;
     std::fs::write(directory.join("index.js"), EXTENSION).map_err(|error| error.to_string())?;
     std::fs::write(directory.join("providers").join("shisa.mjs"), SHISA).map_err(|error| error.to_string())?;
+    std::fs::write(directory.join("providers").join("runtime.mjs"), RUNTIME_PROVIDERS).map_err(|error| error.to_string())?;
     std::fs::write(directory.join("artifacts.mjs"), ARTIFACTS).map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -216,6 +221,7 @@ mod tests {
         assert!(directory.join("package.json").is_file());
         assert!(directory.join("index.js").is_file());
         assert!(directory.join("providers/shisa.mjs").is_file());
+        assert!(directory.join("providers/runtime.mjs").is_file());
         assert!(directory.join("artifacts.mjs").is_file());
         let manifest = std::fs::read_to_string(directory.join("package.json")).unwrap();
         assert!(manifest.contains("pi"));
