@@ -57,7 +57,7 @@ for (const legacy of [false,true]) {
   await expect(dialog.getByLabel('Value',{exact:true})).toHaveValue('fixture-secret');
   await dialog.getByRole('tab',{name:'Language',exact:true}).click();
   await expect(dialog.getByRole('combobox',{name:'Launcher interface language'})).toBeVisible();
-  await expect(dialog.getByRole('combobox')).toHaveCount(1);
+  await expect(dialog.getByRole('combobox')).toHaveCount(3);
   const toggle=dialog.getByRole('switch',{name:'Japanese-first mode',exact:true});
   if(!legacy) {
    await expect(toggle).not.toBeChecked();
