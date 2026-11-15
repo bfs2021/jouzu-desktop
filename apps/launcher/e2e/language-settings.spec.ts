@@ -80,3 +80,38 @@ test('an unreadable Jouzu language file is never written from here', async ({ pa
   await expect(dialog.getByRole('combobox', { name: 'Jouzu reply language' })).toBeDisabled();
   await expect(dialog.getByText(/could not be read, so the defaults are in effect/)).toBeVisible();
 });
+
+test('first run asks interface and reply language on the connect-a-model page and never derives the profile', async ({ page }) => {
+  const requests: any[] = [];
+  let state: any = languageState();
+  let profile: string | null = null;
+  await stubHostControl(page, (body: any) => {
+    requests.push(body);
+    if (body.action === 'profile') profile = body.profile;
+    return { ...emptyControlState, profile, modelReady: false, language: state };
+  });
+  await page.addInitScript(() => {
+    (window as any).isTauri = true;
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
+    localStorage.setItem('jouzu.ui.language', 'ja');
+    (window as any).__TAURI_INTERNALS__ = {
+      metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
+      transformCallback: () => 1, unregisterCallback: () => {},
+      invoke: async (command: string) => {
+        if (command === 'component_versions') return { jouzu: '0.2.5', development: true };
+        if (command.includes('version')) return '0.1.0';
+        return 1;
+      },
+    };
+  });
+  await page.goto(UI_BASE);
+  const reply = page.getByRole('combobox', { name: 'Jouzu の応答言語' });
+  await expect(reply).toHaveText('自動');
+  state = languageState({ responseLanguage: resolved('ja') });
+  await reply.click();
+  await page.getByRole('option', { name: '日本語', exact: true }).click();
+  await expect(reply).toHaveText('日本語');
+  expect(requests.filter(body => body.action === 'language')).toEqual([{ action: 'language', responseLanguage: 'ja' }]);
+  // A Japanese interface does not choose the Japanese-first profile.
+  expect(requests.some(body => body.action === 'profile' && body.profile === 'ja')).toBe(false);
+});

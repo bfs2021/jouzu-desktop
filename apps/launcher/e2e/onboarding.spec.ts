@@ -37,11 +37,14 @@ async function openSetup(page:Page, initial:{profile?:string|null;modelReady?:bo
  await page.goto(UI_BASE);
 }
 
-test('a missing model opens the connect-a-model page, without a language step', async ({page}) => {
+test('a missing model opens the one connect-a-model page, which asks interface and reply language first', async ({page}) => {
  await openSetup(page,{modelReady:false});
  await expect(page.getByRole('heading',{name:'Connect a model'})).toBeVisible();
  await expect(page.getByRole('button',{name:'Sign in to Shisa.AI',exact:true})).toBeVisible();
- await expect(page.getByRole('button',{name:'English',exact:true})).toHaveCount(0);
+ // Same page, no separate step: the two choices Jouzu's own first run asks, separately.
+ await expect(page.getByRole('combobox',{name:'Launcher interface language'})).toBeVisible();
+ await expect(page.getByRole('combobox',{name:'Jouzu reply language'})).toBeVisible();
+ await expect(page.getByRole('button',{name:'Continue',exact:true})).toHaveCount(0);
 });
 
 test('Shisa.AI authorization keeps its actions together and cancels cleanly', async ({page}) => {
