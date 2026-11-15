@@ -158,7 +158,7 @@ impl Inner {
 }
 
 pub struct WarmPool {
-    spec: Box<dyn Fn(Option<&Path>) -> SpawnSpec + Send + Sync>,
+    spec: Box<dyn Fn(Option<&Path>) -> Result<SpawnSpec, String> + Send + Sync>,
     memory: Option<PathBuf>,
     inner: Mutex<Inner>,
     changed: Box<dyn Fn(Value) + Send + Sync>,
@@ -172,7 +172,7 @@ impl WarmPool {
     ///
     /// `memory` is a file that keeps the target workspace across host restarts.
     pub fn new(
-        spec: impl Fn(Option<&Path>) -> SpawnSpec + Send + Sync + 'static,
+        spec: impl Fn(Option<&Path>) -> Result<SpawnSpec, String> + Send + Sync + 'static,
         memory: Option<PathBuf>,
         changed: impl Fn(Value) + Send + Sync + 'static,
     ) -> Arc<Self> {
@@ -277,7 +277,13 @@ impl WarmPool {
             (inner.generation, plan[place].clone())
         };
         self.notify();
-        let mut spec = (self.spec)(workspace.as_deref());
+        let mut spec = match (self.spec)(workspace.as_deref()) {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.failed(generation, format!("Could not start the runtime: {error}"));
+                return;
+            }
+        };
         // Below normal until someone waits for it (`hurry`, `take`): the spare
         // stays there, the first one is hurried by the loading screen.
         spec.low_priority = true;

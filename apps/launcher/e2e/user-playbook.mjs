@@ -32,6 +32,81 @@ async function waitForConversationText(text, timeout = 30_000) {
   await conversation().getByText(text, { exact: true }).first().waitFor({ timeout });
 }
 
+const settingsDialog = () => page.getByRole("dialog").first();
+async function openSettingsTab(name) {
+  await page.getByRole("button", { name: "Settings", exact: true }).first().click();
+  await settingsDialog().getByRole("tab", { name }).click();
+}
+async function modelMenuItems() {
+  await page.getByRole("button", { name: /model/i }).first().click();
+  await page.getByRole("menuitemradio").first().waitFor({ timeout: 5_000 });
+  const items = await page.getByRole("menuitemradio").allInnerTexts();
+  return items.map(item => item.trim());
+}
+
+/**
+ * Scenario: a Shisa API key saved in Settings works without restarting the app.
+ * Measures: after saving SHISA_API_KEY and pressing "Refresh models", the model
+ * menu gains the Shisa models and a new session using one gets a reply.
+ * Why: the configuration service and the runtimes used to read saved variables
+ * from the wrong file, once, at startup, so the refresh did nothing (issue #63).
+ * Needs PLAYBOOK_SHISA_API_KEY (a test key, never a personal one) and a home where
+ * Shisa.AI was never signed in or signed out; without the key it is reported as
+ * not run, not as passed.
+ */
+async function shisaKeyWithoutRestart() {
+  const name = "Shisa key saved in Settings works without restart";
+  const key = process.env.PLAYBOOK_SHISA_API_KEY;
+  if (!key) {
+    result.scenarios.push({ name, ok: true, skipped: true, detail: "not run: PLAYBOOK_SHISA_API_KEY is not set" });
+    return;
+  }
+  await newSession().click();
+  await composer().waitFor({ timeout: 10_000 });
+  const before = await modelMenuItems();
+  await page.keyboard.press("Escape");
+
+  let start = now();
+  await openSettingsTab("Environment");
+  await settingsDialog().getByRole("button", { name: "Add variable" }).click();
+  await settingsDialog().getByRole("textbox", { name: "Name" }).last().fill("SHISA_API_KEY");
+  await settingsDialog().getByLabel("Value").last().fill(key);
+  const save = settingsDialog().getByRole("button", { name: "Save", exact: true });
+  await save.click();
+  await save.waitFor({ state: "visible" });
+  await settingsDialog().getByRole("tab", { name: "Model providers" }).click();
+  // The key alone counts as a Shisa.AI connection, so the refresh control appears.
+  const refresh = settingsDialog().getByRole("button", { name: "Refresh models" });
+  await refresh.waitFor({ timeout: 15_000 });
+  await refresh.click();
+  await page.waitForFunction(() => {
+    const button = [...document.querySelectorAll("button")].find(item => item.textContent?.includes("Refresh models"));
+    return button && !button.disabled;
+  }, null, { timeout: 30_000 });
+  await page.keyboard.press("Escape");
+
+  await newSession().click();
+  await composer().waitFor({ timeout: 10_000 });
+  const after = await modelMenuItems();
+  const added = after.filter(item => !before.includes(item));
+  await mark("shisaKeySavedToModelsListed", now() - start);
+  if (!added.length) {
+    await page.keyboard.press("Escape");
+    scenario(name, false, "no new model appeared in the menu after saving the key and refreshing");
+    return;
+  }
+  await page.getByRole("menuitemradio").filter({ hasText: added[0] }).first().click();
+  start = now();
+  await composer().fill("Reply with only the word OK.");
+  await send().click();
+  await stop().waitFor({ state: "detached", timeout: 60_000 }).catch(() => {});
+  await send().waitFor({ timeout: 60_000 });
+  await mark("shisaFirstTurnEnd", now() - start);
+  const text = await conversation().innerText();
+  scenario(name, /\bok\b/i.test(text.replace("Reply with only the word OK.", "")), `model: ${added[0]}`);
+  await page.screenshot({ path: process.env.TEMP + "\\playbook-03-shisa-key.png" });
+}
+
 try {
   let start = now();
   await page.reload({ waitUntil: "domcontentloaded" });
@@ -96,6 +171,8 @@ try {
   await mark("savedSessionSwitch", now() - start);
   assertGate("savedSessionSwitch", now() - start, 2_000);
   scenario("P0-3 reopen saved session", true);
+
+  await shisaKeyWithoutRestart();
 } catch (error) {
   result.errors.push(String(error?.stack ?? error));
   await page.screenshot({ path: process.env.TEMP + "\\playbook-failure.png" }).catch(() => {});
