@@ -285,10 +285,60 @@ export interface FileApi {
   snapshot(path: string): Promise<{ files: Array<{ path: string; size: number; modified: number }>; truncated: boolean }>;
 }
 
+export type WebAccessMode = "off" | "local" | "networks";
+
+export interface WebAccessNetwork {
+  name: string;
+  address: string;
+  kind: "lan" | "tailnet";
+  enabled: boolean;
+  /** Set while this network is being served. */
+  url: string | null;
+  error: string | null;
+}
+
+export interface WebAccessDevice {
+  id: string;
+  name: string;
+  network: string;
+  createdAt: string;
+  lastSeen: string | null;
+}
+
+/** Who may use the Jouzu web UI besides the desktop window (issue #91). */
+export interface WebAccessState {
+  mode: WebAccessMode;
+  port: number | null;
+  /** Whether web traffic is encrypted; plain HTTP today. */
+  secure: boolean;
+  localUrl: string | null;
+  localError: string | null;
+  networks: WebAccessNetwork[];
+  /** Enabled networks that are not on this computer right now. */
+  unavailableNetworks: string[];
+  devices: WebAccessDevice[];
+  pairing: boolean;
+}
+
+export interface WebAccessPairing {
+  code: string;
+  expiresInSeconds: number;
+  links: Array<{ network: string; url: string }>;
+}
+
 export interface SettingsApi {
   environment: {
     read(): Promise<EnvironmentEntry[]>;
     save(entries: EnvironmentEntry[]): Promise<void>;
+  };
+  /** Only the desktop window may manage web access; web clients get `forbidden`. */
+  webAccess: {
+    read(): Promise<WebAccessState>;
+    update(scope: { mode: WebAccessMode; networks: string[] }): Promise<WebAccessState>;
+    pair(): Promise<WebAccessPairing>;
+    cancelPairing(): Promise<void>;
+    /** Remove one paired device, or every device when `id` is omitted. */
+    revoke(id?: string): Promise<WebAccessState>;
   };
   control(request: unknown): Promise<unknown>;
 }

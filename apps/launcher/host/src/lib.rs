@@ -21,6 +21,7 @@ pub mod models;
 pub mod runtime;
 pub mod sessions_repair;
 pub mod session;
+pub mod web_access;
 
 use session::{ApiError, CreateRequest, SendRequest, SessionManager};
 
@@ -59,6 +60,7 @@ pub struct AppState {
     pub control: Arc<control::ControlManager>,
     pub events: Arc<events::EventHub>,
     pub models: Arc<models::Models>,
+    pub web: Arc<web_access::WebAccess>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,6 +246,13 @@ pub fn router(state: AppState) -> Router {
             get(read_environment).put(save_environment),
         )
         .route("/capabilities", get(capabilities))
+        .route("/web-access", get(web_access_snapshot).put(update_web_access))
+        .route(
+            "/web-access/pairing",
+            axum::routing::post(start_web_pairing).delete(cancel_web_pairing),
+        )
+        .route("/web-access/devices", axum::routing::delete(revoke_all_web_devices))
+        .route("/web-access/devices/{id}", axum::routing::delete(revoke_web_device))
         .route("/control", axum::routing::post(control_request))
         .route("/control/cancel", axum::routing::post(control_cancel))
         .route("/control/events", get(control_events))
@@ -341,6 +350,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(root))
+        .route("/pair", get(pair_device))
         .nest("/v1", api)
         .fallback(get(static_file))
         .layer(axum::middleware::from_fn_with_state(
@@ -1246,7 +1256,15 @@ fn session_not_found() -> ApiError {
     )
 }
 
-async fn root(State(state): State<AppState>, uri: Uri) -> Response {
+async fn root(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+    uri: Uri,
+) -> Response {
+    // The internal token is never exchanged on a web access listener.
+    if matches!(listener.map(|value| value.0), Some(web_access::Listener::Web { .. })) {
+        return serve_index(&state).await;
+    }
     let query = query_map(uri.query().unwrap_or(""));
     if let Some(token) = query.get("token").filter(|value| !value.is_empty()) {
         if token == state.token.as_str() {
@@ -1635,14 +1653,20 @@ async fn tool_models(
         .map(Json)
 }
 
-async fn capabilities(State(state): State<AppState>) -> Json<Value> {
+async fn capabilities(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+) -> Json<Value> {
+    let scopes = state
+        .web
+        .scopes(listener.map(|value| value.0).unwrap_or(web_access::Listener::Internal));
     let default_workspace = default_workspace();
     Json(json!({
         "contract": "2026-11-12",
         "hostVersion": state.version,
         "runtimeKind": crate::runtime::adapter::pi::KIND,
         "features": ["chat", "sse", "replay", "prompts", "history-paging", "history-blocks", "models", "control", "tools", "mcp", "recovery", "deferred-sessions"],
-        "scopes": ["loopback"],
+        "scopes": scopes,
         "limits": { "maxMessageBytes": 32768, "maxUploadBytes": 26214400 },
         "defaultWorkspace": default_workspace,
     }))
@@ -1701,6 +1725,15 @@ async fn log_failures(State(state): State<AppState>, request: Request, next: Nex
 }
 
 async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    // On a web access listener the guard already authenticated the device; the
+    // internal token is not accepted there.
+    if matches!(listener_of(&request), web_access::Listener::Web { .. }) {
+        return if request.extensions().get::<web_access::DeviceId>().is_some() {
+            next.run(request).await
+        } else {
+            unauthorized("This device is not paired").into_response()
+        };
+    }
     if authorized(&state, request.headers()) {
         next.run(request).await
     } else {
@@ -1738,6 +1771,9 @@ async fn host_origin_guard(
     request: Request,
     next: Next,
 ) -> Response {
+    if let web_access::Listener::Web { local } = listener_of(&request) {
+        return web_guard(state, local, request, next).await;
+    }
     if allowed_host(&state, request.headers()) && allowed_origin(&state, request.headers()) {
         next.run(request).await
     } else {
@@ -1965,6 +2001,356 @@ pub fn now_rfc3339() -> String {
 #[allow(dead_code)]
 fn _keep_imports(_: DateTime<Utc>, _: Body) {}
 
+// ---- Web access (issue #91) -------------------------------------------------
+
+fn listener_of(request: &Request) -> web_access::Listener {
+    request
+        .extensions()
+        .get::<web_access::Listener>()
+        .copied()
+        .unwrap_or(web_access::Listener::Internal)
+}
+
+fn peer_of(request: &Request) -> Option<std::net::IpAddr> {
+    request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip())
+}
+
+fn device_cookie(headers: &HeaderMap) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    let prefix = format!("{}=", web_access::DEVICE_COOKIE);
+    cookies
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix(&prefix).map(str::to_string))
+}
+
+fn forbidden(message: &'static str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": { "code": "forbidden", "message": message, "retryable": false } })),
+    )
+        .into_response()
+}
+
+/// Every request on a web access listener: the peer must be on the network that
+/// listener serves, Host/Origin must name the listener, and everything except
+/// the pairing page needs a paired device. A device's response stream ends as
+/// soon as the device is revoked or its network stops being served.
+async fn web_guard(
+    state: AppState,
+    local: std::net::SocketAddr,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let peer = peer_of(&request);
+    let host_ok = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| web_access::WebAccess::host_allowed(local, host));
+    let origin_ok = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|origin| web_access::WebAccess::origin_allowed(local, origin));
+    let Some(peer) = peer.filter(|peer| state.web.peer_allowed(local, *peer)) else {
+        log(
+            state.sessions.home(),
+            "warn",
+            "web.refused",
+            json!({ "listener": local.to_string(), "peer": peer.map(|value| value.to_string()), "reason": "network" }),
+        );
+        return forbidden("This device is not on a network Jouzu allows");
+    };
+    if !host_ok || !origin_ok {
+        log(
+            state.sessions.home(),
+            "warn",
+            "web.refused",
+            json!({ "listener": local.to_string(), "peer": peer.to_string(), "reason": "host-or-origin" }),
+        );
+        return forbidden("Unknown Host or Origin");
+    }
+    let path = request.uri().path().to_string();
+    if path == "/pair" {
+        return next.run(request).await;
+    }
+    let device = device_cookie(request.headers())
+        .and_then(|cookie| state.web.authorize(&cookie, local, peer));
+    let Some(device) = device else {
+        return if path.starts_with("/v1/") || path == "/v1" {
+            unauthorized("This device is not paired").into_response()
+        } else {
+            Redirect::to("/pair").into_response()
+        };
+    };
+    request
+        .extensions_mut()
+        .insert(web_access::DeviceId(device.clone()));
+    let response = next.run(request).await;
+    let web = state.web.clone();
+    let mut changes = web.subscribe();
+    let (parts, body) = response.into_parts();
+    let ended = async move {
+        while changes.changed().await.is_ok() {
+            if !web.still_allowed(&device, local, peer) {
+                break;
+            }
+        }
+    };
+    use futures_util::StreamExt;
+    let stream = body.into_data_stream().take_until(Box::pin(ended));
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn internal_only(listener: Option<axum::Extension<web_access::Listener>>) -> Result<(), Response> {
+    match listener.map(|value| value.0) {
+        Some(web_access::Listener::Web { .. }) => {
+            Err(forbidden("Web access is managed only in Jouzu Desktop"))
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn web_access_snapshot(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+) -> Response {
+    if let Err(response) = internal_only(listener) {
+        return response;
+    }
+    Json(state.web.snapshot()).into_response()
+}
+
+async fn update_web_access(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+    Json(update): Json<web_access::Update>,
+) -> Response {
+    if let Err(response) = internal_only(listener) {
+        return response;
+    }
+    let mode = update.mode;
+    let networks = update.networks.clone();
+    if let Err(message) = state.web.update(update) {
+        return ApiError::new(StatusCode::BAD_REQUEST, "invalid-request", message, false).into_response();
+    }
+    log(
+        state.sessions.home(),
+        "info",
+        "web.scope",
+        json!({ "mode": mode, "networks": networks }),
+    );
+    reconcile_web_access(&state).await;
+    Json(state.web.snapshot()).into_response()
+}
+
+async fn start_web_pairing(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+) -> Response {
+    if let Err(response) = internal_only(listener) {
+        return response;
+    }
+    match state.web.start_pairing() {
+        Ok((code, lifetime)) => {
+            log(state.sessions.home(), "info", "web.pairing.started", json!({}));
+            Json(json!({
+                "code": code,
+                "expiresInSeconds": lifetime.as_secs(),
+                "links": state.web.pairing_urls(&code),
+            }))
+            .into_response()
+        }
+        Err(message) => {
+            ApiError::new(StatusCode::CONFLICT, "invalid-request", message, false).into_response()
+        }
+    }
+}
+
+async fn cancel_web_pairing(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+) -> Response {
+    if let Err(response) = internal_only(listener) {
+        return response;
+    }
+    state.web.cancel_pairing();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn revoke_web_device(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = internal_only(listener) {
+        return response;
+    }
+    match state.web.revoke(Some(&id)) {
+        Ok(true) => {
+            log(state.sessions.home(), "info", "web.device.revoked", json!({ "device": id }));
+            Json(state.web.snapshot()).into_response()
+        }
+        Ok(false) => ApiError::new(StatusCode::NOT_FOUND, "invalid-request", "No such device", false).into_response(),
+        Err(message) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message, false).into_response(),
+    }
+}
+
+async fn revoke_all_web_devices(
+    State(state): State<AppState>,
+    listener: Option<axum::Extension<web_access::Listener>>,
+) -> Response {
+    if let Err(response) = internal_only(listener) {
+        return response;
+    }
+    match state.web.revoke(None) {
+        Ok(_) => {
+            log(state.sessions.home(), "info", "web.device.revoked", json!({ "device": "all" }));
+            Json(state.web.snapshot()).into_response()
+        }
+        Err(message) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message, false).into_response(),
+    }
+}
+
+/// `/pair` on a web access listener: with `?code=` it exchanges the code for a
+/// device credential cookie; without one it shows a form to type the code.
+async fn pair_device(State(state): State<AppState>, request: Request) -> Response {
+    let web_access::Listener::Web { local } = listener_of(&request) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let headers = request.headers();
+    let uri = request.uri();
+    let Some(peer) = peer_of(&request) else {
+        return forbidden("This device is not on a network Jouzu allows");
+    };
+    let query = query_map(uri.query().unwrap_or(""));
+    let Some(code) = query.get("code").filter(|value| !value.trim().is_empty()) else {
+        return pair_page(None);
+    };
+    let name = web_access::device_name(headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok()));
+    match state.web.complete_pairing(code, &name, local, peer) {
+        Ok((credential, network)) => {
+            log(
+                state.sessions.home(),
+                "info",
+                "web.device.paired",
+                json!({ "name": name, "network": network, "peer": peer.to_string() }),
+            );
+            let cookie = format!(
+                "{}={credential}; HttpOnly; SameSite=Strict; Path=/; Max-Age=34560000",
+                web_access::DEVICE_COOKIE
+            );
+            let mut response = Redirect::to("/").into_response();
+            match HeaderValue::from_str(&cookie) {
+                Ok(value) => {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                    response
+                }
+                Err(_) => forbidden("Pairing failed"),
+            }
+        }
+        Err(error) => {
+            log(
+                state.sessions.home(),
+                "warn",
+                "web.pairing.failed",
+                json!({ "peer": peer.to_string(), "reason": format!("{error:?}") }),
+            );
+            pair_page(Some(error.message()))
+        }
+    }
+}
+
+fn pair_page(error: Option<String>) -> Response {
+    let escape = |text: &str| {
+        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    };
+    let error = error
+        .map(|message| format!("<p class=\"error\" role=\"alert\">{}</p>", escape(&message)))
+        .unwrap_or_default();
+    let html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pair with Jouzu</title>
+<style>:root{{color-scheme:light dark;font-family:system-ui,sans-serif}}body{{margin:0;display:grid;place-items:center;min-height:100vh;padding:16px;box-sizing:border-box}}main{{max-width:360px;width:100%}}h1{{font-size:1.25rem}}p{{line-height:1.5;opacity:.85}}input,button{{font:inherit;padding:10px 12px;border-radius:8px;width:100%;box-sizing:border-box}}input{{border:1px solid #8886;letter-spacing:.2em;text-transform:uppercase}}button{{margin-top:12px;border:0;background:#2563eb;color:#fff}}.error{{color:#dc2626}}</style></head>
+<body><main><h1>Pair this device with Jouzu</h1><p>In Jouzu Desktop, open Settings, Web access, and choose Pair a device. Enter the code shown there.</p>{error}
+<form method="get" action="/pair"><label for="code">Pairing code</label><input id="code" name="code" autocomplete="one-time-code" autocapitalize="characters" maxlength="12" required autofocus><button type="submit">Pair</button></form></main></body></html>"#
+    );
+    let mut response = axum::response::Html(html).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+struct WebListener {
+    stop: tokio::sync::oneshot::Sender<()>,
+}
+
+static WEB_LISTENERS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<std::net::SocketAddr, WebListener>>> =
+    std::sync::OnceLock::new();
+
+/// Starts and stops web access listeners so they match the saved scope and the
+/// current interface addresses. Safe to call at any time.
+pub async fn reconcile_web_access(state: &AppState) {
+    let listeners = WEB_LISTENERS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let mut listeners = listeners.lock().await;
+    let desired = state.web.desired();
+    let stale: Vec<std::net::SocketAddr> = listeners
+        .keys()
+        .filter(|address| !desired.contains(address))
+        .copied()
+        .collect();
+    for address in stale {
+        if let Some(listener) = listeners.remove(&address) {
+            let _ = listener.stop.send(());
+            log(state.sessions.home(), "info", "web.listener.stopped", json!({ "address": address.to_string() }));
+        }
+    }
+    let mut failures = HashMap::new();
+    for address in &desired {
+        if listeners.contains_key(address) {
+            continue;
+        }
+        match tokio::net::TcpListener::bind(address).await {
+            Ok(tcp) => {
+                let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+                let app = router(state.clone()).layer(axum::Extension(web_access::Listener::Web { local: *address }));
+                let home = state.sessions.home().to_path_buf();
+                let served = *address;
+                tokio::spawn(async move {
+                    let result = axum::serve(
+                        tcp,
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async move {
+                        let _ = stopped.await;
+                    })
+                    .await;
+                    if let Err(error) = result {
+                        log(&home, "error", "web.listener.failed", json!({ "address": served.to_string(), "error": error.to_string() }));
+                    }
+                });
+                log(state.sessions.home(), "info", "web.listener.started", json!({ "address": address.to_string() }));
+                listeners.insert(*address, WebListener { stop });
+            }
+            Err(error) => {
+                log(state.sessions.home(), "error", "web.listener.failed", json!({ "address": address.to_string(), "error": error.to_string() }));
+                failures.insert(*address, error.to_string());
+            }
+        }
+    }
+    let serving: Vec<std::net::SocketAddr> = desired
+        .iter()
+        .filter(|address| listeners.contains_key(address))
+        .copied()
+        .collect();
+    state.web.set_serving(serving, failures);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1997,6 +2383,7 @@ mod tests {
             control: control_manager(&dist),
             events: events::EventHub::new(),
             models: Arc::new(models::Models::new(&dist)),
+            web: Arc::new(web_access::WebAccess::disabled()),
         }
     }
 
@@ -2022,6 +2409,139 @@ mod tests {
             .header(header::HOST, host)
             .body(Body::empty())
             .unwrap()
+    }
+
+
+    /// One raw HTTP/1.1 exchange over a real socket, so the web listener sees a
+    /// real peer address. Returns the status line, headers and body as text.
+    async fn raw(address: std::net::SocketAddr, path: &str, extra: &str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{extra}\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response)).await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn set_cookie(response: &str) -> Option<String> {
+        response.lines().find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower
+                .starts_with("set-cookie:")
+                .then(|| line["set-cookie:".len()..].trim().split(';').next().unwrap().to_string())
+        })
+    }
+
+    /// Issue #91 end to end over real sockets: off by default, local scope
+    /// needs pairing, the internal token is refused on the web listener, a
+    /// paired device works, revoking it refuses the next request and ends its
+    /// open event stream, and turning access off stops the listener.
+    #[tokio::test]
+    async fn web_access_requires_pairing_and_revoke_ends_access() {
+        let dir = dist();
+        let home = tempfile::tempdir().unwrap();
+        let mut state = state(dir.path().to_path_buf());
+        state.web = Arc::new(web_access::WebAccess::load(home.path()));
+        reconcile_web_access(&state).await;
+        assert!(state.web.desired().is_empty(), "access is off by default");
+
+        state
+            .web
+            .update(web_access::Update { mode: web_access::Mode::Local, networks: vec![] })
+            .unwrap();
+        reconcile_web_access(&state).await;
+        let address = state.web.desired()[0];
+        assert!(address.ip().is_loopback());
+
+        // Unpaired: API refused, pages redirect to pairing, the internal token does not help.
+        assert!(raw(address, "/v1/capabilities", "").await.starts_with("HTTP/1.1 401"));
+        let token = format!("Authorization: Bearer {}\r\n", "a".repeat(64));
+        assert!(raw(address, "/v1/capabilities", &token).await.starts_with("HTTP/1.1 401"));
+        let index = raw(address, &format!("/?token={}", "a".repeat(64)), "").await;
+        assert!(set_cookie(&index).is_none(), "{index}");
+        assert!(raw(address, "/", "").await.contains("location: /pair"));
+        // A foreign Host header is refused even from this computer.
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            stream
+                .write_all(b"GET /pair HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"));
+        }
+
+        // Pair.
+        let (code, _) = state.web.start_pairing().unwrap();
+        assert!(raw(address, "/pair?code=WRONGWRO", "").await.contains("not correct"));
+        let paired = raw(address, &format!("/pair?code={code}"), "User-Agent: Firefox/120 (Windows)\r\n").await;
+        let cookie = set_cookie(&paired).expect("device cookie");
+        assert!(cookie.starts_with(web_access::DEVICE_COOKIE));
+        let header = format!("Cookie: {cookie}\r\n");
+        let capabilities = raw(address, "/v1/capabilities", &header).await;
+        assert!(capabilities.starts_with("HTTP/1.1 200"), "{capabilities}");
+        assert!(capabilities.contains("\"loopback\""));
+        // A paired browser still cannot manage web access.
+        assert!(raw(address, "/v1/web-access", &header).await.starts_with("HTTP/1.1 403"));
+        // The cookie means nothing on the internal listener.
+        let internal = router(state.clone());
+        let request = Request::builder()
+            .uri("/v1/capabilities")
+            .header(header::HOST, "127.0.0.1:40123")
+            .header(header::COOKIE, cookie.clone())
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(internal, request).await.0, StatusCode::UNAUTHORIZED);
+
+        // Open an event stream, then revoke: the stream ends and the next request is refused.
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let request = format!(
+                "GET /v1/events HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\n{header}\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let device = state.web.snapshot()["devices"][0]["id"].as_str().unwrap().to_string();
+        assert!(state.web.revoke(Some(&device)).unwrap());
+        {
+            use tokio::io::AsyncReadExt as _;
+            let mut response = Vec::new();
+            let ended = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut buffer = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            response.extend_from_slice(&buffer[..read]);
+                            // chunked transfer: the terminating chunk ends the stream
+                            if response.ends_with(b"0\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(ended.is_ok(), "the revoked device's event stream must end");
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+        }
+        assert!(raw(address, "/v1/capabilities", &header).await.starts_with("HTTP/1.1 401"));
+
+        // Off: the listener closes.
+        state
+            .web
+            .update(web_access::Update { mode: web_access::Mode::Off, networks: vec![] })
+            .unwrap();
+        reconcile_web_access(&state).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
     }
 
     #[tokio::test]
@@ -2415,6 +2935,7 @@ mod session_tests {
             control: Arc::new(control::ControlManager::new(&home, &home, None, &home.join("data"), None).expect("control manager")),
             events: events::EventHub::new(),
             models: Arc::new(models::Models::new(&home)),
+            web: Arc::new(web_access::WebAccess::disabled()),
         }
         .pipe(router)
     }

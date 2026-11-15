@@ -33,6 +33,13 @@ separate binary with its own HTTP contract, so another client can drive the same
   starts the first one while the window is still loading.
 - **Control.** Jouzu configuration (sign-in, models, tools, language) runs through the host
   one operation at a time, with progress and device codes reported as events.
+- **Web access.** Off by default. In Settings → Web access the user can let a browser on
+  this computer, or devices on trusted networks they turn on (private LAN ranges and
+  Tailscale; never a public address or a wildcard bind), use the same UI on a persistent
+  port. Every browser is paired with a one-time code and gets its own credential, stored
+  only as a hash in `web-access.json`; paired devices can be removed one by one or all at
+  once, which also ends their open event streams. The desktop window keeps its own
+  loopback listener and token, which web listeners never accept.
 - **Timing.** Every step is logged with its timing to `logs/host.log`, in development and
   release builds alike.
 

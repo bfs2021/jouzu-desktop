@@ -30,7 +30,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Input } from "./components/ui/input";
 import { getVersion } from "@tauri-apps/api/app";
 import { open, confirm } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, Search, X, ArrowUpRight, Settings, Languages, KeyRound, SlidersHorizontal, RefreshCw, LoaderCircle, Minus, Maximize2, Minimize2, Plus, Copy, Check, Wrench, Palette } from "lucide-react";
+import { FolderOpen, Search, X, ArrowUpRight, Settings, Languages, KeyRound, SlidersHorizontal, RefreshCw, LoaderCircle, Minus, Maximize2, Minimize2, Plus, Copy, Check, Wrench, Palette, Globe } from "lucide-react";
+import { WebAccessSection, webAccessTitle } from "./web-access-section";
 import { Dialog, DialogContent, DialogTitle, DialogDescription, DialogClose } from "./components/ui/dialog";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import { ScrollArea } from "./components/ui/scroll-area";
@@ -621,6 +622,7 @@ export function App() {
                 <TabsTrigger value="tools" className="min-h-10 justify-start gap-2 px-3"><Wrench className="size-4 shrink-0" aria-hidden="true" />{t.toolsTab}</TabsTrigger>
                 <TabsTrigger value="appearance" className="min-h-10 justify-start gap-2 px-3"><Palette className="size-4 shrink-0" aria-hidden="true" />{t.appearance}</TabsTrigger>
                 <TabsTrigger value="environment" className="min-h-10 justify-start gap-2 px-3"><SlidersHorizontal className="size-4 shrink-0" aria-hidden="true" />{t.environment}</TabsTrigger><TabsTrigger value="general" className="min-h-10 justify-start gap-2 px-3"><Languages className="size-4 shrink-0" aria-hidden="true" />{t.general}</TabsTrigger>
+                {native && <TabsTrigger value="web-access" className="min-h-10 justify-start gap-2 px-3"><Globe className="size-4 shrink-0" aria-hidden="true" />{webAccessTitle(locale)}</TabsTrigger>}
                 <TabsTrigger value="system" className="min-h-10 justify-start gap-2 whitespace-normal px-3 text-left"><RefreshCw className="size-4 shrink-0" aria-hidden="true" />{t.system}</TabsTrigger>
               </TabsList>
             </aside>
@@ -662,6 +664,7 @@ export function App() {
                   </CardContent></Card>
 
                 </TabsContent>
+                {native && <TabsContent value="web-access" className="m-0 space-y-4"><WebAccessSection locale={locale} openUrl={async url => { const target = new URL(url); if (target.protocol !== "http:" || target.hostname !== "127.0.0.1" || target.pathname !== "/pair" || target.username || target.password) throw new Error("Unexpected web access link"); await openUrl(target.href); }} confirm={message => confirm(message, { title: webAccessTitle(locale), kind: "warning" })} /></TabsContent>}
                 <TabsContent value="system" className="m-0 space-y-4">
                   
                   <UpdatePreview locale={locale} focusIndex={updateFocus} live={{

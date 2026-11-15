@@ -165,6 +165,13 @@ function hostGroups(client: HostClient) {
         await client.saveEnvironment(entries);
       },
     },
+    webAccess: {
+      read: () => client.webAccess(),
+      update: scope => client.updateWebAccess(scope),
+      pair: () => client.startWebPairing(),
+      cancelPairing: () => client.cancelWebPairing(),
+      revoke: id => client.revokeWebDevice(id),
+    },
     async control() {
       unsupported();
     },

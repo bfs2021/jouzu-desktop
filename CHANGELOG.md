@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Settings has a Web access page. It shows who can connect besides this window and lets
+  you allow a browser on this computer, or devices on trusted networks such as your local
+  network or Tailscale. Every browser must be paired with a one-time code, and paired
+  devices can be removed at any time. Web access stays off until you turn it on (#91).
+
 ## 1.1.2 - 2026-11-15
 
 QA channel fixes.
