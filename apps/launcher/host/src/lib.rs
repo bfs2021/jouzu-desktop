@@ -1974,7 +1974,7 @@ mod tests {
 
     fn control_manager(home: &Path) -> Arc<control::ControlManager> {
         Arc::new(
-            control::ControlManager::new(home, home, None, home, &home.join("data"), None)
+            control::ControlManager::new(home, home, None, &home.join("data"), None)
                 .expect("control manager"),
         )
     }
@@ -2412,7 +2412,7 @@ mod session_tests {
             started: Instant::now(),
             version: "0.1.0".to_string(),
             sessions: manager,
-            control: Arc::new(control::ControlManager::new(&home, &home, None, &home, &home.join("data"), None).expect("control manager")),
+            control: Arc::new(control::ControlManager::new(&home, &home, None, &home.join("data"), None).expect("control manager")),
             events: events::EventHub::new(),
             models: Arc::new(models::Models::new(&home)),
         }

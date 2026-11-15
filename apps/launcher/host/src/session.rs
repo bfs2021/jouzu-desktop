@@ -176,11 +176,21 @@ pub struct SessionConfig {
 impl SessionConfig {
     /// The runtime's environment. Session-specific variables are left out for
     /// a warm runtime, which does not belong to a session yet.
+    ///
+    /// Order: the host's own environment, then the variables saved in Settings
+    /// (read from disk now, so a saved key reaches the next runtime without a
+    /// host restart), then the variables the host manages, which always win.
+    /// A saved file that cannot be read is an error, never an empty list.
     fn environment(
         &self,
         session_id: Option<&str>,
         session_path: Option<&str>,
-    ) -> Vec<(OsString, OsString)> {
+    ) -> Result<Vec<(OsString, OsString)>, String> {
+        let saved = crate::environment::enabled(&self.runtime_home).map_err(|message| {
+            format!(
+                "saved environment variables could not be read ({message}). Open Settings > Environment and save them again"
+            )
+        })?;
         let mut environment: HashMap<String, (OsString, OsString)> = std::env::vars_os()
             .filter(|(name, _)| {
                 let text = name.to_string_lossy();
@@ -194,6 +204,9 @@ impl SessionConfig {
         let mut set = |name: &str, value: OsString| {
             environment.insert(name.to_ascii_uppercase(), (OsString::from(name), value));
         };
+        for (name, value) in saved {
+            set(&name, OsString::from(value));
+        }
         set("JOUZU_HOME", self.runtime_home.as_os_str().to_os_string());
         set("JOUZU_NO_UPDATE", OsString::from("1"));
         set("PI_SKIP_VERSION_CHECK", OsString::from("1"));
@@ -210,7 +223,7 @@ impl SessionConfig {
         for (key, value) in &self.spec.env {
             set(key, OsString::from(value));
         }
-        environment.into_values().collect()
+        Ok(environment.into_values().collect())
     }
 }
 
@@ -4121,14 +4134,14 @@ impl Session {
             .unwrap_or_else(|| canonical_path(&self.workspace_path))
     }
 
-    fn spawn_spec(&self) -> SpawnSpec {
-        SpawnSpec {
+    fn spawn_spec(&self) -> Result<SpawnSpec, String> {
+        Ok(SpawnSpec {
             program: self.config.spec.program.clone(),
             args: self.config.spec.args.clone(),
-            env: self.environment(),
+            env: self.environment()?,
             workspace: PathBuf::from(self.runtime_cwd()),
             low_priority: false,
-        }
+        })
     }
 
     fn spawn_runtime(self: &Arc<Self>, initial: bool, from_pending: bool) -> bool {
@@ -4171,7 +4184,10 @@ impl Session {
                 json!({ "session": self.id, "warm": before }),
             );
         }
-        match RuntimeSupervisor::start(self.spawn_spec(), event_tx) {
+        match self
+            .spawn_spec()
+            .and_then(|spec| RuntimeSupervisor::start(spec, event_tx))
+        {
             Ok(runtime) => {
                 self.install_runtime(runtime, event_rx);
                 true
@@ -4400,7 +4416,7 @@ impl Session {
         }
     }
 
-    fn environment(&self) -> Vec<(OsString, OsString)> {
+    fn environment(&self) -> Result<Vec<(OsString, OsString)>, String> {
         let path = self
             .session_path
             .lock()
@@ -5679,12 +5695,14 @@ impl SessionManager {
         let log_home = config.home.clone();
         let pool = config.warm.get_or_init(|| {
             WarmPool::new(
-                move |workspace| SpawnSpec {
-                    program: spawn.spec.program.clone(),
-                    args: spawn.spec.args.clone(),
-                    env: spawn.environment(None, None),
-                    workspace: workspace.map(Path::to_path_buf).unwrap_or_else(|| scratch.clone()),
-                    low_priority: true,
+                move |workspace| {
+                    Ok(SpawnSpec {
+                        program: spawn.spec.program.clone(),
+                        args: spawn.spec.args.clone(),
+                        env: spawn.environment(None, None)?,
+                        workspace: workspace.map(Path::to_path_buf).unwrap_or_else(|| scratch.clone()),
+                        low_priority: true,
+                    })
                 },
                 Some(memory),
                 move |status| {
@@ -5988,4 +6006,52 @@ fn find_program(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    fn config(runtime_home: &Path) -> SessionConfig {
+        SessionConfig {
+            spec: RuntimeSpec { program: PathBuf::from("node"), args: Vec::new(), env: Vec::new() },
+            home: runtime_home.to_path_buf(),
+            runtime_home: runtime_home.to_path_buf(),
+            bash: None,
+            replay_limit: DEFAULT_REPLAY_LIMIT,
+            events: None,
+            warm: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    fn value(environment: &[(OsString, OsString)], name: &str) -> Option<String> {
+        environment
+            .iter()
+            .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn an_unreadable_saved_file_stops_the_spawn_with_a_reason() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("launcher-environment.bin"), b"broken").unwrap();
+        let error = config(home.path()).environment(None, None).unwrap_err();
+        assert!(error.contains("saved environment variables could not be read"), "{error}");
+    }
+
+    /// Issue #63: warm and session runtimes carry the variables saved in
+    /// Settings, read at spawn; host-managed variables still win.
+    #[cfg(windows)]
+    #[test]
+    fn saved_variables_reach_the_next_runtime() {
+        let home = tempfile::tempdir().unwrap();
+        let config = config(home.path());
+        assert_eq!(value(&config.environment(None, None).unwrap(), "SHISA_API_KEY"), None);
+        let entry = |name: &str, value: &str| crate::environment::Entry { name: name.into(), value: value.into(), enabled: true };
+        crate::environment::save(home.path(), &[entry("SHISA_API_KEY", "saved"), entry("JOUZU_NO_UPDATE", "0")]).unwrap();
+        let environment = config.environment(Some("s1"), None).unwrap();
+        assert_eq!(value(&environment, "SHISA_API_KEY").as_deref(), Some("saved"));
+        assert_eq!(value(&environment, "JOUZU_NO_UPDATE").as_deref(), Some("1"));
+        assert_eq!(value(&environment, "JOUZU_HOME"), Some(home.path().to_string_lossy().into_owned()));
+    }
 }
