@@ -209,12 +209,15 @@ export class HostClient {
           return;
         }
         const reader = response.body?.getReader();
-        if (!reader) return;
+        // A stream the host closes is a disconnect like any other: the caller
+        // reconnects from its last sequence instead of going deaf.
+        const ended = () => new ApiError("runtime-unavailable", "Event stream ended", true);
+        if (!reader) { onError?.(ended()); return; }
         const decoder = new TextDecoder();
         let buffer = "";
         for (;;) {
           const { value, done } = await reader.read();
-          if (done) return;
+          if (done) { if (!controller.signal.aborted) onError?.(ended()); return; }
           buffer += decoder.decode(value, { stream: true });
           let index;
           while ((index = buffer.indexOf("\n\n")) >= 0) {

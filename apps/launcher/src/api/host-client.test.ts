@@ -163,4 +163,15 @@ describe("HostClient", () => {
     expect(query.get("clientId")).toBe("ui-1");
     expect(query.get("capabilities")?.split(",")).toEqual(expect.arrayContaining(["prompts", "control"]));
   });
+  test("a global stream the host closes is reported, so the window reconnects", async () => {
+    const fetchImpl = (async () => new Response(
+      new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode("id: 7\nevent: control.device\ndata: {\"seq\":7}\n\n")); controller.close(); } }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )) as typeof fetch;
+    const client = new HostClient({ baseUrl: "http://host", fetchImpl });
+    const seen: number[] = [];
+    const ended = new Promise<unknown>(resolve => client.subscribeEvents("ui-1", 0, event => seen.push(event.seq ?? 0), resolve));
+    expect(await ended).toMatchObject({ code: "runtime-unavailable" });
+    expect(seen).toEqual([7]);
+  });
 });
