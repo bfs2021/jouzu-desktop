@@ -25,7 +25,9 @@ sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 tempfile = "3"
 tauri-plugin-opener = "2"
-tauri-plugin-updater = "2"
+# Without the default "zip" feature: Windows updates are the signed setup.exe itself, never a
+# zip archive, so the zip extractor (and its advisories) is not built in.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 tauri-plugin-single-instance = "2"
 
 # The renderer failure record reads WebView2's own event, which Tauri hands over through with_webview.
