@@ -51,3 +51,15 @@ Uses a throwaway `JOUZU_HOME`. Saves reply and artifact language through the des
 adapter and checks that a new runtime's system prompt carries those instructions; then saves a
 change the way Jouzu's own Settings does and checks the desktop reads it and the next runtime
 uses it. Results are written to `language-settings-result.json`.
+
+## Turn files stay with their session
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_WS_A = '<workspace A>'; $env:JOUZU_E2E_WS_B = '<workspace B>'
+node e2e-runtime/turn-files-session.mjs
+```
+
+Needs the fixture provider and server, and both folders added as workspaces. Runs a turn in B,
+then a turn in A during which a file in A is written, then opens B's session: A's summary must
+list the file and B's must not (#79). Results are written to `turn-files-session-result.json`.

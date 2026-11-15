@@ -179,8 +179,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   const [imageRepair, setImageRepair] = useState(false);
   // Files the current turn actually changed. The transcript only carries edit-tool
   // arguments, so a file written by a shell command needs a workspace comparison.
-  const [turnChangedFiles, setTurnChangedFiles] = useState<string[]>([]);
+  // Files the last turn changed, with the session that ran it: the summary shows them
+  // only under that session's own transcript, never under another one on screen.
+  const [turnChanged, setTurnChanged] = useState<{ session: string; files: string[] } | null>(null);
   const turnBaseline = useRef<WorkspaceSnapshot | null>(null);
+  // Bumped whenever the view leaves the workspace a snapshot was taken for,
+  // so a slow snapshot that resolves afterwards is dropped.
+  const turnGeneration = useRef(0);
   const [sessionError, setSessionError] = useState<string | null>(null);
   // The entry session (ADR 0004 / 0049): the app opens the last selected session of
   // this folder, else its most recent one, else a new one, while it is loading, so
@@ -352,21 +357,28 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // partial list.
   useEffect(() => {
     if (!snapshot.connected) return;
+    const generation = turnGeneration.current;
     if (snapshot.projection.running) {
       if (turnBaseline.current) return;
       void (api.files.snapshot(path) as Promise<WorkspaceSnapshot>)
-        .then(before => { if (!turnBaseline.current) turnBaseline.current = before; })
+        .then(before => { if (generation === turnGeneration.current && !turnBaseline.current) turnBaseline.current = before; })
         .catch(() => { /* The summary falls back to edit-tool arguments. */ });
       return;
     }
     const before = turnBaseline.current;
-    if (!before) return;
+    const session = snapshot.sessionFile;
+    if (!before || !session) return;
     turnBaseline.current = null;
     void (api.files.snapshot(path) as Promise<WorkspaceSnapshot>)
-      .then(after => setTurnChangedFiles(snapshotComplete(before) && snapshotComplete(after) ? changedFiles(before, after) : []))
-      .catch(() => setTurnChangedFiles([]));
+      .then(after => {
+        if (generation !== turnGeneration.current) return;
+        setTurnChanged({ session, files: snapshotComplete(before) && snapshotComplete(after) ? changedFiles(before, after) : [] });
+      })
+      .catch(() => { if (generation === turnGeneration.current) setTurnChanged(null); });
   }, [snapshot.connected, snapshot.projection.running, path]);
-  useEffect(() => { setTurnChangedFiles([]); turnBaseline.current = null; }, [path, revision]);
+  // A new workspace starts without the previous turn's files; within a workspace they
+  // are shown only under the session that ran the turn (see changedFiles below).
+  useEffect(() => { turnGeneration.current += 1; setTurnChanged(null); turnBaseline.current = null; }, [path, revision]);
   // Only a live turn blocks a runtime restart. A saved draft does not: it lives in
   // localStorage and must not make a model refresh wait for the composer to empty.
   useEffect(() => { onBusyChange?.(snapshot.pending || snapshot.projection.running); }, [snapshot.pending, snapshot.projection.running, onBusyChange]);
@@ -1428,7 +1440,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         </div>
       </div> : !snapshot.sessionId && !activePreview && !localSubmitted ? <div role="status" className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Opening session…</div> : <div className="flex min-h-0 flex-1"><div className="flex min-w-[520px] flex-1 flex-col">
         <div className="relative flex min-h-0 flex-1 flex-col">
-          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={turnChangedFiles} />
+          <ChatConversation key={conversationKey} projection={conversationProjection} reasoningLive={!!liveThinking} workspace={path} busy={snapshot.pending} pendingUser={localSubmitted} outbox={showingAttached ? snapshot.outbox : undefined} onFork={(prompt, index) => void forkTurn(prompt, index)} onOpenArtifacts={openArtifactsPanel} changedFiles={showingAttached && turnChanged && normalizedPath(turnChanged.session) === normalizedPath(snapshot.sessionFile ?? "") ? turnChanged.files : []} />
         </div>
         <div className="relative">
           <div className="mx-auto w-full max-w-3xl">
