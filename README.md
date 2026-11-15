@@ -50,14 +50,13 @@ There are two update channels for the same installation, chosen in **Settings â†
 | Stable (default) | Releases that have already passed testing on QA. |
 | QA | Every new build first, for testing. |
 
-QA is not a separate app: it uses the same install folder, the same data and the same
-sign-ins, so switching channels does not reset anything. A QA installation shows the Jouzu
-icon with a **QA** badge on the window, taskbar and shortcuts, so it is never mistaken for a
-stable one. Switching back to stable offers the current stable build, and nothing installs
-until you confirm.
+The channel is only which feed the app updates from: it uses the same install folder, the
+same data and the same sign-ins, so switching does not reset anything. Switching back to
+stable offers the current stable build, and nothing installs until you confirm.
 
-A stable release is never built separately: it is a QA build promoted unchanged, so stable
-users get exactly the bytes that were tested. Details are in
+QA packages are release candidates (`X.Y.Z-rc.N`) and carry the Jouzu icon with a **QA**
+badge. A stable release `X.Y.Z` is built again from the QA-tested commit with the normal icon,
+must pass the full user playbook with a real model, and is signed. Details are in
 [`packaging/launcher/RELEASE-CHANNELS.md`](packaging/launcher/RELEASE-CHANNELS.md).
 
 ## Where data lives
@@ -135,9 +134,10 @@ both with one build id.
 
 - **Development gate** (`launcher-checks.yml`, every pull request): debug build, unit tests,
   host and shell tests, mocked UI specs. Kept fast.
-- **Release gate** (`desktop-release.yml`, `desktop-promote.yml`, `dependency-audit.yml`):
-  release build, signing, update feed, dependency audit, and acceptance on a QA installation
-  before promotion to stable.
+- **Release gate** (`desktop-release.yml`, `desktop-stable.yml`, `dependency-audit.yml`):
+  QA release candidates with the QA icon and their feed; stable builds rebuilt from a QA
+  candidate, examined with the full user playbook and a real model before the stable feed
+  moves; dependency audit.
 
 ## Contributing
 
