@@ -5021,7 +5021,20 @@ impl SessionManager {
         Ok(workspaces)
     }
 
+    /// Pins, archives and titles by session, keyed in one form (`canonical_path`)
+    /// whatever form the file stores them in.
     fn read_preferences(&self) -> HashMap<String, SessionPreference> {
+        self.stored_preferences()
+            .into_iter()
+            .map(|(key, preference)| (canonical_path(&key), preference))
+            .collect()
+    }
+
+    /// The file as stored. Its keys are what `std::fs::canonicalize` gives (on
+    /// Windows `\\?\C:\…`): the launcher before the host wrote them that way and
+    /// still reads them that way, and the file is shared with it across the
+    /// stable and QA channels. So entries keep their stored key.
+    fn stored_preferences(&self) -> HashMap<String, SessionPreference> {
         let Ok(bytes) = std::fs::read(self.preferences_path()) else {
             return HashMap::new();
         };
@@ -5066,9 +5079,16 @@ impl SessionManager {
             return Err(ApiError::bad_request("Unknown session path"));
         }
         let key = canonical_path(&path.to_string_lossy());
-        let mut preferences = self.read_preferences();
+        let mut preferences = self.stored_preferences();
+        // Update the entry already stored for this session, in whatever form its
+        // key was written; a new one is stored in the launcher's form.
+        let stored = preferences
+            .keys()
+            .find(|stored| canonical_path(stored) == key)
+            .cloned()
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let (pinned, archived, title) = {
-            let preference = preferences.entry(key.clone()).or_default();
+            let preference = preferences.entry(stored).or_default();
             if let Some(value) = pinned {
                 preference.pinned = value;
             }

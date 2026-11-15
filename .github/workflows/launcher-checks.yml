@@ -34,7 +34,12 @@ jobs:
       - name: RustSec audit
         run: |
           cargo install cargo-audit --locked
-          cargo audit
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # The repository root has no Cargo.lock: each native crate keeps its own.
+          foreach ($lock in 'apps/launcher/host/Cargo.lock', 'apps/launcher/src-tauri/Cargo.lock') {
+            cargo audit --file $lock
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
       - name: Frontend build and unit tests
         run: |
           npm --prefix apps/launcher run build

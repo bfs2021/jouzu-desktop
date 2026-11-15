@@ -5370,6 +5370,32 @@ mod session_tests {
     }
 
     #[test]
+    fn pins_saved_by_the_launcher_before_the_host_still_apply_and_keep_their_key() {
+        let (manager, home, _workspace) = manager(50);
+        let state = home.path().join("data").join("state");
+        let directory = state.join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("pinned.jsonl");
+        std::fs::write(&path, format!("{}\n", json!({ "type": "session", "version": 3, "id": "p", "cwd": "C:/work" }))).unwrap();
+        let canonical = path.canonicalize().unwrap().to_string_lossy().into_owned();
+        // The launcher (1.0.x, still on the stable channel) keys entries by
+        // `fs::canonicalize`, which on Windows starts with `\\?\`.
+        let legacy = format!("\\\\?\\{canonical}");
+        std::fs::write(
+            state.join("session-preferences.json"),
+            json!({ legacy.clone(): { "pinned": true, "archived": false, "title": "Kept" } }).to_string(),
+        )
+        .unwrap();
+        let updated = manager.update_session(&canonical, None, Some(true), None).unwrap();
+        assert_eq!(updated["pinned"], true, "{updated}");
+        assert_eq!(updated["title"], "Kept", "{updated}");
+        let stored: Value = serde_json::from_slice(&std::fs::read(state.join("session-preferences.json")).unwrap()).unwrap();
+        let keys: Vec<&String> = stored.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec![&legacy], "{stored}");
+        assert_eq!(stored[&legacy]["archived"], true, "{stored}");
+    }
+
+    #[test]
     fn flow_reports_filter_hidden_and_keep_displayed_reports() {
         let (manager, home, _workspace) = manager(50);
         let directory = home.path().join("data").join("state").join("sessions");
