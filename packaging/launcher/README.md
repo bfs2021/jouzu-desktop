@@ -128,7 +128,8 @@ interface shows text that belongs to the published bytes and a recipe without no
 recipe is downloaded from `JOUZU_RECIPE_BASE_URL`, authenticated, staged into
 `<managed root>/updates/versions/<slot>` using the installed Node and pnpm, health-checked, and
 activated by writing `active.json`; a failed check restores the previous selection. Superseded slots
-are pruned after activation, and user data stays in `<managed root>/data`.
+are pruned after activation. User data is not part of the installation: it stays in Jouzu's own home
+(`JOUZU_HOME`, else `%LOCALAPPDATA%\Shisa.ai\Jouzu\data`), which Desktop and `jz` share and Desktop never copies.
 
 The recipe workflow prepares the runtime once per npm version and uploads it for reuse, and a launcher
 build restores that qualified runtime instead of preparing the npm package a second time.

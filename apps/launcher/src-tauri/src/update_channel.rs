@@ -1,13 +1,13 @@
 //! Which update feed this installation follows.
 //!
-//! QA is not a separate product: it is the same application, the same install directory
-//! and the same user data, following a second feed. A tester switches an ordinary
-//! installation to QA, upgrades in place, and switches back. Every stable release ships
-//! on QA first, so the upgrade path a user takes has already run on a real installation.
+//! The channel is independent of the installed package: it only says which feed the app
+//! updates from, with the same install directory and the same user data. A tester
+//! switches an installation to QA, upgrades in place, and switches back. Every stable
+//! release is first a QA release candidate (X.Y.Z-rc.N); the stable build X.Y.Z is built
+//! again from that candidate's commit (packaging/launcher/RELEASE-CHANNELS.md).
 //!
 //! The QA feed sits beside the stable one in the same release repository: the
-//! `desktop-update` tag becomes `desktop-update-qa`. Release assets are shared, so a
-//! promoted build is byte for byte the build QA installed.
+//! `desktop-update` tag becomes `desktop-update-qa`.
 
 use std::{
     path::{Path, PathBuf},
@@ -138,7 +138,7 @@ fn newer(a: Option<Update>, b: Option<Update>) -> Option<Update> {
 ///
 /// Stable offers the stable feed's build when it differs from what runs: newer is an
 /// ordinary update, older means this installation came back from QA. QA offers the newest
-/// of the QA and stable feeds, and never an older build, so a promoted release reaches QA
+/// of the QA and stable feeds, and never an older build, so a stable release reaches QA
 /// installations too.
 async fn find(app: &tauri::AppHandle, channel: Channel) -> Result<Option<Update>, String> {
     let stable = stable_endpoint(app)?;
@@ -164,10 +164,9 @@ pub fn update_channel() -> Result<Channel, String> {
 }
 
 #[tauri::command]
-pub fn update_channel_set(app: tauri::AppHandle, channel: Channel, pending: tauri::State<'_, Pending>) -> Result<Channel, String> {
+pub fn update_channel_set(channel: Channel, pending: tauri::State<'_, Pending>) -> Result<Channel, String> {
     let managed = managed()?;
     write(&managed, channel)?;
-    crate::channel_icon::apply(&app, channel);
     // An offer found on the other feed is no longer the one this installation follows.
     *pending.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     crate::logs::note(&managed, &format!("launcher update channel={channel:?}"));

@@ -5696,8 +5696,8 @@ impl SessionManager {
         let config = self.config().cloned().ok_or_else(|| {
             // Without a `--runtime`, the host runs the bundled Node and app; say
             // which one is missing rather than falling back to anything else.
-            let managed = self.runtime_home.parent().unwrap_or(&self.home);
-            let node = managed.join("runtime").join("node").join("node.exe");
+            // The installation is under the host home; Jouzu's data may be elsewhere.
+            let node = self.home.join("runtime").join("node").join("node.exe");
             let message = if !node.is_file() {
                 format!("Jouzu's bundled Node.js is missing ({}). Reinstall Jouzu to restore it.", node.display())
             } else {
@@ -5712,7 +5712,7 @@ impl SessionManager {
                 false,
             )
         })?;
-        std::fs::create_dir_all(&config.home.join("data")).ok();
+        std::fs::create_dir_all(&config.runtime_home).ok();
         // A new session gets its identity at creation, not after the runtime
         // handshake. The index and navigation can then show it before the first
         // reply, including when the turn is stopped during starting.

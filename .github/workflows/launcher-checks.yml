@@ -3,7 +3,7 @@ name: Desktop Windows checks
 # The development gate: what every pull request push must keep passing, kept
 # fast. It proves the code builds and its tests pass in debug. Release builds,
 # installers, dependency audits and the timed playbook belong to the release
-# gate (desktop-release.yml, desktop-promote.yml, dependency-audit.yml).
+# gate (desktop-release.yml, desktop-stable.yml, dependency-audit.yml).
 # No signing identity, secrets or publication on pull requests.
 on:
   workflow_dispatch:

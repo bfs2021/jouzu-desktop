@@ -172,6 +172,14 @@ try {
   await newSession().waitFor({ timeout: 30_000 });
   await mark("reloadToReady", now() - start);
 
+  // PLAYBOOK_SCENARIO=shisa-key runs only the Shisa key scenario. It needs a home where
+  // Shisa.AI was never connected, while the main flow needs a working model, so the
+  // stable release exam runs it on a home of its own (#86).
+  if (process.env.PLAYBOOK_SCENARIO === "shisa-key") {
+    await shisaKeyWithoutRestart();
+    throw Object.assign(new Error("done"), { done: true });
+  }
+
   // P0-1: new session, own message, model, one turn.
   start = now();
   await newSession().click();
@@ -291,8 +299,11 @@ try {
   await page.getByRole("option", { name: previousReplyLanguage, exact: true }).click();
   await page.keyboard.press("Escape");
 } catch (error) {
-  result.errors.push(String(error?.stack ?? error));
-  await page.screenshot({ path: process.env.TEMP + "\\playbook-failure.png" }).catch(() => {});
+  // The single-scenario mode ends the flow early on purpose; that is not a failure.
+  if (!error?.done) {
+    result.errors.push(String(error?.stack ?? error));
+    await page.screenshot({ path: process.env.TEMP + "\\playbook-failure.png" }).catch(() => {});
+  }
 }
 
 result.pass = result.errors.length === 0
