@@ -4,7 +4,14 @@
 //! projection is joined with the active catalog's limits/prices, and thinking levels
 //! come from pi-ai's `getSupportedThinkingLevels`. The host never reads
 //! `cache/model-catalog/**`; the adapter returns already-joined rows and the host
-//! caches that answer so a page reload costs no process.
+//! keeps that answer in memory so a page reload costs no process.
+//!
+//! The answer depends on sign-ins, keys, providers and catalogs, which change through
+//! Settings, through saved environment variables, or through Jouzu in a terminal that
+//! shares the data folder. It is therefore never kept across host starts, and every
+//! successful change through the host drops it (issue #84): a snapshot written once
+//! and reused for days kept offering models of a signed-out account and never listed
+//! providers added later.
 
 use std::{
     path::{Path, PathBuf},
@@ -28,45 +35,32 @@ const SCHEMA_VERSION: u64 = 3;
 
 impl Models {
     pub fn new(host_home: &Path) -> Self {
+        let path = host_home.join("host-state").join("models.json");
+        // Older hosts kept the snapshot on disk; it may describe another account.
+        let _ = std::fs::remove_file(&path);
         Self {
-            path: host_home.join("host-state").join("models.json"),
+            path,
             cached: Mutex::new(None),
         }
     }
 
     fn load(&self) -> Option<Value> {
-        if let Some(value) = self
-            .cached
+        self.cached
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-        {
-            return Some(value);
-        }
-        let bytes = std::fs::read(&self.path).ok()?;
-        let value: Value = serde_json::from_slice(&bytes).ok()?;
-        if !value.get("models").map(Value::is_array).unwrap_or(false)
-            || value.get("schemaVersion").and_then(Value::as_u64) != Some(SCHEMA_VERSION)
-        {
-            return None;
-        }
+    }
+
+    /// Settings changed: the next request lists the models again.
+    pub fn invalidate(&self) {
         *self
             .cached
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(value.clone());
-        Some(value)
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let _ = std::fs::remove_file(&self.path);
     }
 
     fn store(&self, value: Value) -> Value {
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let temp = self.path.with_extension("json.tmp");
-        if let Ok(bytes) = serde_json::to_vec_pretty(&value) {
-            if std::fs::write(&temp, bytes).is_ok() {
-                let _ = std::fs::rename(&temp, &self.path);
-            }
-        }
         *self
             .cached
             .lock()
@@ -101,9 +95,20 @@ impl Models {
     }
 
     async fn enumerate(&self, control: &ControlManager) -> Result<Value, ApiError> {
-        let status = control
-            .request(json!({ "action": "available-models" }))
-            .await
+        // The configuration service runs one operation at a time. At startup the UI's
+        // status read and catalog refresh run beside this listing; wait for them
+        // instead of answering "no models" while they finish.
+        let mut answer = control.request(json!({ "action": "available-models" })).await;
+        for _ in 0..120 {
+            match &answer {
+                Err(error) if error.code == "control-busy" => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    answer = control.request(json!({ "action": "available-models" })).await;
+                }
+                _ => break,
+            }
+        }
+        let status = answer
             .map_err(|error| {
                 ApiError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -250,20 +255,42 @@ mod default_model_tests {
     use super::*;
 
     fn write(home: &Path, default_model: &str) -> Models {
-        let directory = home.join("host-state");
+        let models = Models::new(home);
+        models.store(json!({
+            "schemaVersion": SCHEMA_VERSION,
+            "models": [{ "provider": "shisa", "id": "qwen", "name": "Qwen 3.8" }],
+            "defaultProvider": "shisa",
+            "defaultModel": default_model,
+        }));
+        models
+    }
+
+    /// Issue #84: a snapshot an older host left on disk may describe a signed-out
+    /// account or miss a provider added since; it is never served.
+    #[test]
+    fn a_snapshot_left_on_disk_is_not_served() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join("host-state");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             directory.join("models.json"),
-            json!({
-                "schemaVersion": SCHEMA_VERSION,
-                "models": [{ "provider": "shisa", "id": "qwen", "name": "Qwen 3.8" }],
-                "defaultProvider": "shisa",
-                "defaultModel": default_model,
-            })
-            .to_string(),
+            json!({ "schemaVersion": SCHEMA_VERSION, "models": [{ "provider": "shisa", "id": "old" }] }).to_string(),
         )
         .unwrap();
-        Models::new(home)
+        let models = Models::new(home.path());
+        assert!(models.load().is_none());
+        assert!(!directory.join("models.json").exists());
+    }
+
+    /// Issue #84: a settings change drops the snapshot, so the next listing is new.
+    #[test]
+    fn a_settings_change_drops_the_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let models = write(home.path(), "qwen");
+        assert!(models.load().is_some());
+        models.invalidate();
+        assert!(models.load().is_none());
+        assert_eq!(models.default_model(), None);
     }
 
     #[test]
@@ -286,11 +313,8 @@ mod default_model_tests {
     #[test]
     fn a_catalog_offering_without_an_output_limit_is_marked_unusable() {
         let home = tempfile::tempdir().unwrap();
-        let directory = home.path().join("host-state");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            directory.join("models.json"),
-            json!({
+        let models = Models::new(home.path());
+        models.store(json!({
                 "schemaVersion": SCHEMA_VERSION,
                 "models": [
                     { "provider": "catalog:x", "id": "chotto", "name": "Shisa Translate", "maxTokens": null },
@@ -299,11 +323,7 @@ mod default_model_tests {
                 ],
                 "defaultProvider": "catalog:x",
                 "defaultModel": "chotto",
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let models = Models::new(home.path());
+        }));
         assert!(models.check_usable("catalog:x", "chotto").is_err());
         assert!(models.check_usable("catalog:x", "qwen").is_ok());
         assert!(models.check_usable("capy", "other").is_ok());

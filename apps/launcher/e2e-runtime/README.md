@@ -76,3 +76,14 @@ node e2e-runtime/turn-files-session.mjs
 Needs the fixture provider and server, and both folders added as workspaces. Runs a turn in B,
 then a turn in A during which a file in A is written, then opens B's session: A's summary must
 list the file and B's must not (#79). Results are written to `turn-files-session-result.json`.
+
+## Model list follows settings
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+node e2e-runtime/model-list-fresh.mjs
+```
+
+Needs a model-ready throwaway home. Lists the models, adds a provider and its key through the
+control API, lists again (the provider must be there), removes the key and lists again (it must
+be gone), with no restart (#84). Results are written to `model-list-fresh-result.json`.
