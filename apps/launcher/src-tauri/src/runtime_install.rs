@@ -349,7 +349,7 @@ fn installed_version(app: &Path) -> Result<String, String> {
 
 fn check_health(managed: &Path, node: &Path) -> Result<(), String> {
     let bootstrap = managed.join("app").join("bootstrap.mjs");
-    let home = managed.join("data");
+    let home = crate::runtime::effective_home()?;
     std::fs::create_dir_all(&home).map_err(|error| error.to_string())?;
     let mut command = Command::new(node);
     command
@@ -385,7 +385,7 @@ fn check_control(managed: &Path, node: &Path) -> Result<(), String> {
         .arg("--")
         .arg(managed)
         .arg(managed.join("app"))
-        .env("JOUZU_HOME", managed.join("data"))
+        .env("JOUZU_HOME", crate::runtime::effective_home()?)
         .env("JOUZU_NO_UPDATE", "1")
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
@@ -471,7 +471,7 @@ pub fn install(managed: &Path, progress: Progress) -> Result<String, String> {
     };
     write_tool_scripts(managed)?;
     install_tools(managed, progress)?;
-    crate::image_tool::ensure(managed)?;
+    crate::image_tool::ensure(&crate::runtime::effective_home()?)?;
     Ok(version)
 }
 
