@@ -11,6 +11,32 @@ export interface ControlState {
   defaultModel?: string;
   /** The last catalog refresh: what happened, and a held revision when one waits. */
   catalog?: CatalogOutcome;
+  /** Jouzu's own language settings (localization.json), as a new runtime resolves them. */
+  language?: LanguageState;
+}
+export const RESPONSE_LANGUAGES = ["auto", "en", "ja", "zh-Hans", "zh-Hant"] as const;
+export const ARTIFACT_LANGUAGES = ["preserve", "project", "en", "ja", "zh-Hans", "zh-Hant"] as const;
+export const ARTIFACT_FIELDS = ["comments", "documentation", "commits", "reviews"] as const;
+export type ArtifactLanguage = typeof ARTIFACT_LANGUAGES[number];
+export type ArtifactPolicy = Record<typeof ARTIFACT_FIELDS[number], ArtifactLanguage>;
+/** Jouzu's built-in policy: comments keep their language, the rest follow the project. */
+export const DEFAULT_ARTIFACT_POLICY: ArtifactPolicy = { comments: "preserve", documentation: "project", commits: "project", reviews: "project" };
+export interface LanguageState {
+  /** "ok", "absent", or a file Jouzu refuses to read or overwrite ("invalid", "future"). */
+  status: string;
+  uiLocale: { requested: string; effective: string; source: string };
+  responseLanguage: { requested: string; effective: string; source: string };
+  artifactPolicy: { effective: ArtifactPolicy; source: string };
+}
+/** The same presets Jouzu's Settings offers: its default, or one language for every field.
+ *  A per-field mix written elsewhere is "custom" and is shown, never rewritten. */
+export function artifactPreset(policy: ArtifactPolicy): "default" | ArtifactLanguage | "custom" {
+  if (ARTIFACT_FIELDS.every(field => policy[field] === DEFAULT_ARTIFACT_POLICY[field])) return "default";
+  const first = policy[ARTIFACT_FIELDS[0]];
+  return ARTIFACT_FIELDS.every(field => policy[field] === first) ? first : "custom";
+}
+export function artifactPolicyFor(preset: "default" | ArtifactLanguage): ArtifactPolicy {
+  return preset === "default" ? { ...DEFAULT_ARTIFACT_POLICY } : { comments: preset, documentation: preset, commits: preset, reviews: preset };
 }
 export interface HeldCatalog {
   sourceId: string;
@@ -66,6 +92,15 @@ export function parseControlState(value: unknown): ControlState {
       if (!record(held) || typeof held.revision !== "string" || typeof held.digest !== "string" || !Array.isArray(held.reasons)) return fail();
       if (!held.reasons.every(reason => typeof reason === "string")) return fail();
     }
+  }
+  if (value.language !== undefined) {
+    const language = value.language;
+    const resolved = (entry: unknown) => record(entry) && ["requested", "effective", "source"].every(key => typeof entry[key] === "string");
+    if (!record(language) || typeof language.status !== "string" || !resolved(language.uiLocale) || !resolved(language.responseLanguage)) return fail();
+    const artifact = language.artifactPolicy;
+    if (!record(artifact) || typeof artifact.source !== "string" || !record(artifact.effective)) return fail();
+    const effective = artifact.effective;
+    if (!ARTIFACT_FIELDS.every(field => (ARTIFACT_LANGUAGES as readonly string[]).includes(effective[field] as string))) return fail();
   }
   return value as unknown as ControlState;
 }

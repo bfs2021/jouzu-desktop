@@ -79,6 +79,13 @@ try {
     }, { paths, gatewayUrl: resolveShisaGatewayUrl(process.env), jouzuVersion: loadMetadata().jouzuVersion });
     // Signing in must make the account's models usable without a terminal /reload.
     try { catalog = catalogOutcome(await refreshModelCatalogs()); } catch { /* The next explicit refresh can report it. */ }
+  } else if (request.action === 'language') {
+    // Jouzu's own Settings save: one localization.json, its lock, revision check and backup.
+    const { applyLocalization } = await load('localization-ops');
+    const change = {};
+    for (const key of ['uiLocale', 'responseLanguage', 'artifactPolicy']) if (request[key] !== undefined) change[key] = request[key];
+    if (!Object.keys(change).length) throw new Error('Invalid language request');
+    applyLocalization(paths, { sessionId: 'settings', scope: 'environment', request: change });
   } else if (request.action === 'refresh-catalogs') {
     const refreshed = await refreshModelCatalogs();
     catalog = catalogOutcome(refreshed);
@@ -276,10 +283,22 @@ try {
   const { readShisaAccountStatus } = await load('shisa-link/account');
   const account = { ...readShisaAccountStatus(paths), ...(signOutRevocation ? { revocation: signOutRevocation } : {}) };
   const credentials = await auth.list();
+  // The language a new runtime starts with, resolved the way Jouzu's startup does.
+  const { readLocalizationSettings, resolveUiLocale, osLocaleCandidates } = await load('ui-locale');
+  const { resolveResponseLanguage, resolveArtifactPolicy } = await load('language-settings');
+  const saved = readLocalizationSettings(paths.configDir);
+  const savedSettings = saved.status === 'ok' ? saved.settings : undefined;
+  const pick = ({ requested, effective, source }) => ({ requested, effective, source });
+  const language = {
+    status: saved.status,
+    uiLocale: pick(resolveUiLocale({ ...(process.env.JOUZU_UI_LOCALE ? { env: process.env.JOUZU_UI_LOCALE } : {}), config: saved, os: osLocaleCandidates(process.env) })),
+    responseLanguage: pick(resolveResponseLanguage({ config: savedSettings?.responseLanguage })),
+    artifactPolicy: pick(resolveArtifactPolicy(savedSettings?.artifactPolicy ? { config: savedSettings.artifactPolicy } : {})),
+  };
   // Readiness means the user has configured a usable model source, matching the
   // conditions Jouzu's own doctor reports as "provider.unconfigured".
   const modelReady = account.signedIn || credentials.length > 0 || customProviders.length > 0;
-  console.log(JSON.stringify({ schemaVersion: 1, modelReady, ...(catalog ? { catalog } : {}), profile: readProfileChoice(profilePath)?.profile ?? null, account, customProviders, providers: runtime.getProviders().map(p => ({ id: p.id, name: p.id === 'openai-codex' ? 'Codex' : (p.name ?? p.id), oauth: !!p.auth?.oauth, oauthName: p.auth?.oauth?.name, apiKey: !!p.auth?.apiKey })), credentials, models: runtime.getModels().map(m => ({ provider: m.provider, id: m.id, name: m.name })), defaultProvider: settings.getDefaultProvider(), defaultModel: settings.getDefaultModel() }));
+  console.log(JSON.stringify({ schemaVersion: 1, modelReady, ...(catalog ? { catalog } : {}), language, profile: readProfileChoice(profilePath)?.profile ?? null, account, customProviders, providers: runtime.getProviders().map(p => ({ id: p.id, name: p.id === 'openai-codex' ? 'Codex' : (p.name ?? p.id), oauth: !!p.auth?.oauth, oauthName: p.auth?.oauth?.name, apiKey: !!p.auth?.apiKey })), credentials, models: runtime.getModels().map(m => ({ provider: m.provider, id: m.id, name: m.name })), defaultProvider: settings.getDefaultProvider(), defaultModel: settings.getDefaultModel() }));
 } catch {
   // Do not relay raw upstream errors: they can contain credentials or server input.
   const messages = {
@@ -294,6 +313,7 @@ try {
     'refresh-catalogs': 'Models could not be refreshed. Sign in to Shisa.AI again or add a provider key.',
     'catalog-accept': 'The held catalog could not be applied. Refresh the model list and retry.',
     'catalog-reject': 'The held catalog could not be discarded. Refresh the model list and retry.',
+    language: 'Could not save the language settings. The Jouzu language file may be unreadable or changed elsewhere; nothing was overwritten.',
     'shisa-logout': 'Shisa.AI sign-out could not be fully confirmed. Refresh its state and check the Shisa.AI dashboard.',
   };
   console.log(JSON.stringify({ error: messages[action] ?? 'Unsupported configuration operation.' }));

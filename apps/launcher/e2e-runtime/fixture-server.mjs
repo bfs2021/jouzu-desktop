@@ -18,7 +18,9 @@ export function startFixtureServer(port = 0) {
       const messages = Array.isArray(data.messages) ? data.messages : [];
       const lastUser = [...messages].reverse().find(message => message.role === 'user');
       const text = typeof lastUser?.content === 'string' ? lastUser.content : JSON.stringify(lastUser?.content ?? '');
-      requests.push({ model: data.model, text });
+      // The system prompt is kept so a check can see what the runtime instructed (e.g. its language section).
+      const system = messages.filter(message => message.role === 'system' || message.role === 'developer').map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content ?? '')).join('\n');
+      requests.push({ model: data.model, text, system });
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       const chunk = (delta, finish = null) => response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'deterministic', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
       chunk({ role: 'assistant' });

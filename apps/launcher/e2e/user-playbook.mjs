@@ -257,6 +257,37 @@ try {
   await page.keyboard.press("Escape");
   await shisaKeyWithoutRestart();
   await imageProviderScenario();
+
+  // Reply language set in desktop Settings reaches the next new session.
+  // Measures: the reply of a session opened after the change is written in the chosen
+  // language. Why: the setting is Jouzu's own (shared with Jouzu in a terminal); the
+  // desktop once had no way to see or change it. The previous value is restored after.
+  const openLanguageSettings = async () => {
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByRole("tab", { name: "Language", exact: true }).click();
+    return page.getByRole("combobox", { name: /reply language/i });
+  };
+  let replyLanguage = await openLanguageSettings();
+  const previousReplyLanguage = (await replyLanguage.innerText()).trim();
+  await replyLanguage.click();
+  await page.getByRole("option", { name: "日本語", exact: true }).click();
+  await page.getByRole("combobox", { name: /reply language/i }).filter({ hasText: "日本語" }).waitFor({ timeout: 15_000 });
+  await page.keyboard.press("Escape");
+  await newSession().click();
+  await composer().waitFor({ timeout: 10_000 });
+  const languagePrompt = "Name one primary color, in one short sentence.";
+  await composer().fill(languagePrompt);
+  await send().click();
+  await waitForConversationText(languagePrompt, 5_000);
+  await stop().waitFor({ state: "detached", timeout: 60_000 }).catch(() => {});
+  await page.getByRole("button", { name: /^send$/i }).waitFor({ timeout: 60_000 });
+  const languageReply = (await conversation().innerText()).replace(languagePrompt, "");
+  scenario("Reply language set in Settings applies to the next new session", /[\u3040-\u30ff]/.test(languageReply), languageReply.slice(0, 200));
+  await page.screenshot({ path: process.env.TEMP + "\\playbook-03-reply-language.png" });
+  replyLanguage = await openLanguageSettings();
+  await replyLanguage.click();
+  await page.getByRole("option", { name: previousReplyLanguage, exact: true }).click();
+  await page.keyboard.press("Escape");
 } catch (error) {
   result.errors.push(String(error?.stack ?? error));
   await page.screenshot({ path: process.env.TEMP + "\\playbook-failure.png" }).catch(() => {});

@@ -16,7 +16,7 @@ import { useJouzuUpdate } from "./use-jouzu-update";
 import { useLauncherUpdate } from "./use-launcher-update";
 import { Label } from "./components/ui/label";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { catalogChangeSummary, parseControlState, type ControlState, type HeldCatalog } from "./control-state";
+import { ARTIFACT_FIELDS, ARTIFACT_LANGUAGES, RESPONSE_LANGUAGES, artifactPolicyFor, artifactPreset, catalogChangeSummary, parseControlState, type ArtifactLanguage, type ControlState, type HeldCatalog } from "./control-state";
 
 import { controlCancel, controlRequest, subscribeControl } from "./api/control-client";
 import { useApi } from "./api/context";
@@ -93,8 +93,6 @@ export function App() {
   const [heldCatalog, setHeldCatalog] = useState<HeldCatalog | null>(null);
   const [catalogDeciding, setCatalogDeciding] = useState(false);
   const catalogAttempted = useRef(false);
-  const [japaneseOverride, setJapaneseOverride] = useState<boolean | null>(null);
-  const japaneseChoice = japaneseOverride ?? locale === "ja";
 
   useEffect(() => { document.documentElement.lang = locale; localStorage.setItem("jouzu.ui.language", locale); }, [locale]);
   const [state, setState] = useState<LauncherState | null>(null);
@@ -195,6 +193,19 @@ export function App() {
   }, []);
   const [notice, setNotice] = useState<"requested" | "removed" | null>(null);
   const busy = operation !== null;
+  // Jouzu's language settings live in its localization.json, shared with Jouzu in a
+  // terminal. A file Jouzu refuses to read is never overwritten from here either.
+  const language = setup?.language;
+  const languageWritable = !!language && language.status !== "invalid" && language.status !== "future";
+  const artifactChoice = language ? artifactPreset(language.artifactPolicy.effective) : "default";
+  const [firstRunReply, setFirstRunReply] = useState<string | null>(null);
+  function chooseLocale(value: Locale) {
+    setLocale(value);
+    if (language && languageWritable && language.uiLocale.requested !== value) void configure({ action: "language", uiLocale: value });
+  }
+  // A display language saved on the Jouzu side is the shared choice; "auto" leaves the launcher's own.
+  const savedUiLocale = language?.uiLocale.source === "config" ? language.uiLocale.requested : null;
+  useEffect(() => { if (savedUiLocale && savedUiLocale in locales) setLocale(savedUiLocale as Locale); }, [savedUiLocale]);
   const busyRef = useRef(busy);
   busyRef.current = busy;
   // The configuration service allows one operation at a time; serialize requests
@@ -242,7 +253,10 @@ export function App() {
       const report = await invoke<RuntimeReport>("runtime_report");
       if (report?.mandatory === true || report?.nodeCurrent === false) throw new Error(`The runtime update did not finish (${report?.version ?? "unknown"}).`);
       setRuntimePresent(true);
-      await configure({ action: "profile", profile: japaneseChoice ? "ja" : "core" });
+      // First run uses Core, as Jouzu's does: the interface language never selects the
+      // Japanese-first profile. A profile already chosen (a repair, a reinstall) is kept.
+      const current = await configure({ action: "status" });
+      if (current?.profile === null) await configure({ action: "profile", profile: "core" });
       void loadComponents();
       await readStatus();
     } catch (error) {
@@ -268,8 +282,9 @@ export function App() {
         const next = parseControlState(await controlRequest(request as Record<string, unknown>));
         setSetup(next);
         // Provider, credential and model changes only take effect in a fresh runtime process.
+        // Language settings apply to sessions opened afterwards, as in Jouzu (the host recycles warm runtimes).
         // A catalog refresh decides for itself: only an activated revision needs a new runtime.
-        if (options.restart !== false && request.action !== "status" && request.action !== "import" && request.action !== "profile" && request.action !== "refresh-catalogs") requestSessionRestart();
+        if (options.restart !== false && request.action !== "status" && request.action !== "import" && request.action !== "profile" && request.action !== "language" && request.action !== "refresh-catalogs") requestSessionRestart();
         return next;
       }
       catch (error) { fail("settings", error); return null; }
@@ -543,7 +558,34 @@ export function App() {
       </div>
     </div>
   </main>;
-  // No language step: the one setup page left is connecting a model.
+  // Settings' interface and reply language controls; both are Jouzu's own settings (localization.json).
+  const interfaceLanguageSelect = <Select value={locale} onValueChange={value => chooseLocale(value as Locale)}><SelectTrigger aria-label={t.language} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(locales).map(([key,label]) => <SelectItem key={key} value={key}>{label}</SelectItem>)}</SelectContent></Select>;
+  const replyLanguageField = <div className="space-y-2"><Label htmlFor="response-language">{t.responseLanguage}</Label>
+                        <Select value={language?.responseLanguage.requested ?? "auto"} disabled={busy || !languageWritable} onValueChange={value => void configure({ action: "language", responseLanguage: value })}><SelectTrigger id="response-language" aria-label={t.responseLanguage} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{RESPONSE_LANGUAGES.map(key => <SelectItem key={key} value={key}>{key === "auto" ? t.responseAuto : locales[key]}</SelectItem>)}</SelectContent></Select>
+                        <p className="text-sm leading-relaxed text-muted-foreground">{t.responseLanguageHint}</p></div>;
+  // First run asks the languages on their own page before connecting a model, in Jouzu's
+  // order: the interface language, then the reply language, which suggests the interface
+  // language until it is chosen. Nothing is saved until Continue saves both.
+  const firstRunReplyValue = firstRunReply ?? locale;
+  const languageSetupScreen = <main className="flex h-screen w-full flex-col overflow-hidden bg-background">
+    {firstRunControls}
+    {onboardingBanner(t.setupLanguage, undefined, 0.55, false, true)}
+    <div className="flex min-h-0 flex-1 justify-center overflow-auto px-6 py-8">
+      <div data-slot="page-body" className="onboarding-card m-auto w-full max-w-2xl rounded-2xl border border-border bg-card/70 p-6 shadow-[0_28px_70px_-40px_rgba(0,0,0,0.95)] backdrop-blur-sm sm:p-8">
+        <p className="mb-6 text-sm leading-relaxed text-muted-foreground">{t.setupLanguageHint}</p>
+        {error?.place === "settings" && <div className="mb-4">{errorNotice("settings")}</div>}
+        <div className="space-y-5">
+          <div className="space-y-2"><Label htmlFor="first-run-interface">{t.language}</Label>
+            <Select value={locale} disabled={busy} onValueChange={value => setLocale(value as Locale)}><SelectTrigger id="first-run-interface" aria-label={t.language} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(locales).map(([key,label]) => <SelectItem key={key} value={key}>{label}</SelectItem>)}</SelectContent></Select></div>
+          <div className="space-y-2"><Label htmlFor="first-run-reply">{t.responseLanguage}</Label>
+            <Select value={firstRunReplyValue} disabled={busy} onValueChange={setFirstRunReply}><SelectTrigger id="first-run-reply" aria-label={t.responseLanguage} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{RESPONSE_LANGUAGES.map(key => <SelectItem key={key} value={key}>{key === "auto" ? t.responseAuto : locales[key]}</SelectItem>)}</SelectContent></Select>
+            <p className="text-sm leading-relaxed text-muted-foreground">{t.responseLanguageHint}</p></div>
+        </div>
+        <div className="mt-8 flex justify-end"><Button disabled={busy} onClick={() => void configure({ action: "language", uiLocale: locale, responseLanguage: firstRunReplyValue })}>{t.setupContinue}</Button></div>
+      </div>
+    </div>
+  </main>;
+  // Then the one remaining setup page: connecting a model.
   const modelSetupScreen = <main className="flex h-screen w-full flex-col overflow-hidden bg-background">
     {firstRunControls}
     {onboardingBanner(t.setupConnect, undefined, 0.55, false, true)}
@@ -557,6 +599,8 @@ export function App() {
   </main>;
   if (runtimePresent === null) return connectingScreen;
   if (runtimePresent === false) return prepareScreen;
+  // Only a first run asks: no saved language settings yet. A file Jouzu cannot read is not a first run.
+  if (setup && setup.modelReady === false && setup.language?.status === "absent") return languageSetupScreen;
   if (setup && setup.modelReady === false) return modelSetupScreen;
   return <main aria-busy={busy || undefined} className="flex h-screen w-full flex-col overflow-hidden">
     <span role="status" aria-live="polite" className="sr-only">{busy || notice ? (operation === "preparing" ? t.preparing : operation === "launching" ? t.launching : operation === "choosing" ? t.choosing : operation === "saving" ? t.saving : notice ? t[notice] : null) : state && !state.ready ? t.repair : ""}</span>
@@ -598,7 +642,18 @@ export function App() {
                 </TabsContent>
                 <TabsContent value="general" className="m-0 space-y-4">
                   <Card className="border-border shadow-none"><CardHeader><CardTitle>{t.language}</CardTitle><CardDescription>{t.languageHint}</CardDescription></CardHeader><CardContent>
-                    <Select value={locale} onValueChange={value => setLocale(value as Locale)}><SelectTrigger aria-label={t.language} className="w-full"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(locales).map(([key,label]) => <SelectItem key={key} value={key}>{label}</SelectItem>)}</SelectContent></Select>
+                    {interfaceLanguageSelect}
+                    <div className="mt-6 space-y-4 border-t border-border pt-5">
+                      {replyLanguageField}
+                      <div className="space-y-2"><Label htmlFor="artifact-language">{t.artifactLanguage}</Label>
+                        <Select value={artifactChoice} disabled={busy || !languageWritable} onValueChange={value => { if (value !== "custom") void configure({ action: "language", artifactPolicy: artifactPolicyFor(value as "default" | ArtifactLanguage) }); }}><SelectTrigger id="artifact-language" aria-label={t.artifactLanguage} className="w-full"><SelectValue /></SelectTrigger><SelectContent>
+                          <SelectItem value="default">{t.artifactDefault}</SelectItem>
+                          {ARTIFACT_LANGUAGES.map(key => <SelectItem key={key} value={key}>{key === "preserve" ? t.artifactPreserve : key === "project" ? t.artifactProject : locales[key]}</SelectItem>)}
+                          {artifactChoice === "custom" && language && <SelectItem value="custom" disabled>{`${t.artifactCustom} (${ARTIFACT_FIELDS.map(field => `${field}=${language.artifactPolicy.effective[field]}`).join(" ")})`}</SelectItem>}
+                        </SelectContent></Select>
+                        <p className="text-sm leading-relaxed text-muted-foreground">{t.artifactLanguageHint}</p></div>
+                      <p className="text-sm leading-relaxed text-muted-foreground">{language && !languageWritable ? t.languageFileUnreadable : t.languageAppliesNew}</p>
+                    </div>
                     <div className="mt-6 space-y-3 border-t border-border pt-5">
                       <div className="flex items-center justify-between gap-4"><Label htmlFor="japanese-first">{t.profile}</Label><Switch id="japanese-first" disabled={busy || !setup} checked={setup?.profile === "ja"} aria-describedby="japanese-first-description" onCheckedChange={enabled => void configure({ action: "profile", profile: enabled ? "ja" : "core" })} /></div>
                       <p id="japanese-first-description" className="text-sm leading-relaxed text-muted-foreground">{t.profileHint}</p>

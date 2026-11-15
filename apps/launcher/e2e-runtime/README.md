@@ -39,3 +39,15 @@ call, steering while running, Stop/abort, New chat and continuation. Results are
 
 The native Resume file picker is not automatable through CDP; `switch_session` is covered by
 the RPC matrix and the picker has a manual acceptance checklist in the handoff.
+
+## Language settings
+
+```powershell
+$env:JOUZU_E2E_RUNTIME = '<extracted official setup>'
+node e2e-runtime/language-settings.mjs
+```
+
+Uses a throwaway `JOUZU_HOME`. Saves reply and artifact language through the desktop control
+adapter and checks that a new runtime's system prompt carries those instructions; then saves a
+change the way Jouzu's own Settings does and checks the desktop reads it and the next runtime
+uses it. Results are written to `language-settings-result.json`.
