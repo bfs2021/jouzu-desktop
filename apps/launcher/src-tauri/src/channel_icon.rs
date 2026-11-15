@@ -103,7 +103,13 @@ pub mod shortcuts {
         IShellLinkW, SHChangeNotify, ShellLink, SHCNE_UPDATEITEM, SHCNF_PATHW,
     };
 
-    fn same_file(left: &Path, right: &Path) -> bool {
+    /// Whether two paths name the same file. A shortcut stores its target in long form,
+    /// while the same folder can reach us in 8.3 short form (`C:\Users\RUNNER~1\...`),
+    /// so existing files are compared by their resolved path.
+    pub(super) fn same_file(left: &Path, right: &Path) -> bool {
+        if let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+            return left == right;
+        }
         let normal = |path: &Path| {
             let text = path.to_string_lossy().replace('/', "\\");
             text.trim_start_matches(r"\\?\").to_ascii_lowercase()
@@ -190,6 +196,24 @@ mod tests {
         assert!(qa.width() >= 128 && qa.width() == qa.height());
         let stable = Image::from_bytes(include_bytes!("../icons/icon.png")).unwrap();
         assert_ne!(qa.rgba(), stable.rgba());
+    }
+
+    /// A path in 8.3 short form names the same file as its long form (CI temp folders
+    /// are under `RUNNER~1`).
+    #[cfg(windows)]
+    #[test]
+    fn a_short_path_is_the_same_file_as_its_long_path() {
+        use windows::core::HSTRING;
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        let folder = tempfile::tempdir().unwrap();
+        let long = folder.path().join("a long folder name").join("jouzu-desktop.exe");
+        std::fs::create_dir_all(long.parent().unwrap()).unwrap();
+        std::fs::write(&long, b"").unwrap();
+        let mut buffer = [0u16; 1024];
+        let length = unsafe { GetShortPathNameW(&HSTRING::from(long.as_os_str()), Some(&mut buffer)) } as usize;
+        let short = PathBuf::from(String::from_utf16_lossy(&buffer[..length]));
+        assert!(shortcuts::same_file(&long, &short), "{} vs {}", long.display(), short.display());
+        assert!(!shortcuts::same_file(&long, &folder.path().join("other.exe")));
     }
 
     /// The `.lnk` round trip on a real shortcut: QA points it at the QA icon, stable
