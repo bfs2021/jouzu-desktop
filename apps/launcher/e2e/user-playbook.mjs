@@ -180,11 +180,13 @@ try {
 
   start = now();
   await page.getByRole("button", { name: /model/i }).first().click();
-  const model = page.getByRole("menuitemradio").filter({ hasText: /qwen 3\.8 flash next/i }).first();
+  // PLAYBOOK_MODEL names another model (e.g. "Deterministic" on the fixture provider).
+  const modelName = new RegExp(process.env.PLAYBOOK_MODEL ?? "qwen 3\\.8 flash next", "i");
+  const model = page.getByRole("menuitemradio").filter({ hasText: modelName }).first();
   await model.waitFor({ timeout: 5_000 });
   await mark("modelMenuVisible", now() - start);
   await model.click();
-  await page.getByText(/qwen 3\.8 flash next/i).first().waitFor({ timeout: 5_000 });
+  await page.getByText(modelName).first().waitFor({ timeout: 5_000 });
   scenario("P0-4 model selection", true);
 
   const prompt = "What is 17 × 23? Reply with only the number.";
