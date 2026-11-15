@@ -318,6 +318,9 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     let disposed = false;
     const choosing = !entryChosen.current;
     entryChosen.current = true;
+    // Whether this run decided the entry (opened it, or found there is none). Only
+    // a run that decided ends the loader's wait for the entry.
+    let settled = false;
     void (async () => {
       try {
         const [leased, entry] = await Promise.all([
@@ -325,6 +328,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
           choosing ? chooseEntry(api, path).catch(() => null) : Promise.resolve(null),
         ]);
         if (disposed) { void leased.close().catch(() => {}); return; }
+        settled = true;
         client = leased;
         // Queue the entry before the connection reports ready: the queued switch
         // runs as soon as it does.
@@ -338,12 +342,19 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
         } else if (choosing) setEntryOpening(false);
         bindClient(leased);
       } catch (error) {
-        if (!disposed) setSnapshot(current => ({ ...current, error: describeError(error) }));
+        if (disposed) return;
+        settled = true;
+        setSnapshot(current => ({ ...current, error: describeError(error) }));
         if (choosing) setEntryOpening(false);
       }
     })();
     return () => {
       disposed = true;
+      // Issue #73: a restart (a new catalog revision at startup) can replace this run
+      // while its lease is still waiting for a runtime. The entry it was choosing is
+      // then still undecided, so the next run must choose it; otherwise nothing ever
+      // ends the entry wait and the loader stays up.
+      if (choosing && !settled) entryChosen.current = false;
       unsubscribeRef.current?.();
       connection.current = null;
       // The same rule as every other view change: a session with a transcript is
