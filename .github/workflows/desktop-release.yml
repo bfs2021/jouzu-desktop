@@ -151,16 +151,20 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          # This workflow builds QA packages, and a QA package carries the QA icon (#74):
+          # the executable, installer, window, taskbar and tray all show the badge. The
+          # icon is the only packaging difference; the update channel stays a setting.
+          $bundle = @{ icon = @('icons/qa/32x32.png', 'icons/qa/128x128.png', 'icons/qa/128x128@2x.png', 'icons/qa/icon.icns', 'icons/qa/icon.ico') }
           if ('${{ inputs.publish }}' -eq 'true') {
             # createUpdaterArtifacts is a build-time overlay, so the release always
             # produces the .sig the feed points at.
-            $overlay = Join-Path $env:RUNNER_TEMP 'updater.json'
-            '{"bundle":{"createUpdaterArtifacts":true}}' | Set-Content -LiteralPath $overlay -Encoding utf8NoBOM
-            npx tauri build --bundles nsis --config $overlay
-          } else {
-            # A test build proves the installer without the signing key.
-            npx tauri build --bundles nsis
+            $bundle.createUpdaterArtifacts = $true
           }
+          $overlay = Join-Path $env:RUNNER_TEMP 'qa-build.json'
+          (@{ bundle = $bundle } | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $overlay -Encoding utf8NoBOM
+          Get-Content -LiteralPath $overlay
+          # A test build (publish=false) proves the installer without the signing key.
+          npx tauri build --bundles nsis --config $overlay
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Name and verify the installer
         working-directory: apps/launcher

@@ -35,6 +35,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Refuse to ship a QA package as stable
+        run: |
+          # QA packages carry the QA icon (#74), so a stable release must be its own
+          # build (and later its own SmartScreen signature), not the QA assets re-pointed.
+          # Until that stable build exists, promotion is closed.
+          echo "::error::Stable releases need their own build; promoting QA packages would ship the QA icon (#74)."
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false

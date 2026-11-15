@@ -16,6 +16,8 @@ cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
 d.text((cx - (r - l) / 2 - l, cy - (b - t) / 2 - t), text, font=font, fill=(255, 255, 255, 255))
 icon = Image.alpha_composite(base, badge)
 icon.save(f"{out_dir}/icon.png")
-for size in (32, 128):
+for size in (32, 64, 128):
     icon.resize((size, size), Image.LANCZOS).save(f"{out_dir}/{size}x{size}.png")
 icon.save(f"{out_dir}/icon.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+icon.resize((256, 256), Image.LANCZOS).save(f"{out_dir}/128x128@2x.png")
+icon.save(f"{out_dir}/icon.icns")

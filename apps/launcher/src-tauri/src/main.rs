@@ -24,7 +24,6 @@ mod environment;
 mod runtime;
 mod image_tool;
 mod update_channel;
-mod channel_icon;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -663,7 +662,7 @@ fn main() {
                 .default_window_icon()
                 .cloned()
                 .ok_or("Missing application icon")?;
-            tauri::tray::TrayIconBuilder::with_id(channel_icon::TRAY_ID)
+            tauri::tray::TrayIconBuilder::new()
                 .icon(icon)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -687,10 +686,6 @@ fn main() {
                     }
                 })
                 .build(app)?;
-            // A QA installation shows the QA icon from the first frame on (#74).
-            if let Ok(managed) = runtime::managed_root() {
-                channel_icon::apply(app.handle(), update_channel::read(&managed));
-            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -164,10 +164,9 @@ pub fn update_channel() -> Result<Channel, String> {
 }
 
 #[tauri::command]
-pub fn update_channel_set(app: tauri::AppHandle, channel: Channel, pending: tauri::State<'_, Pending>) -> Result<Channel, String> {
+pub fn update_channel_set(channel: Channel, pending: tauri::State<'_, Pending>) -> Result<Channel, String> {
     let managed = managed()?;
     write(&managed, channel)?;
-    crate::channel_icon::apply(&app, channel);
     // An offer found on the other feed is no longer the one this installation follows.
     *pending.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     crate::logs::note(&managed, &format!("launcher update channel={channel:?}"));
