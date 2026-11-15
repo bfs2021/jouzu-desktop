@@ -89,24 +89,27 @@ async fn main() -> ExitCode {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.clone());
-    let runtime = arg_value(&args, "--runtime")
-        .map(|program| RuntimeSpec {
-            program: PathBuf::from(program),
-            args: arg_values(&args, "--runtime-arg"),
-            env: Vec::new(),
-        })
-        .or_else(|| RuntimeSpec::from_managed(&managed));
-    let bash = arg_value(&args, "--bash")
-        .map(PathBuf::from)
-        .or_else(|| find_bash(&managed));
+    // An explicit `--runtime` is used as given. Otherwise the runtime is the
+    // managed install, which the desktop's first-run preparation creates after
+    // this host has started: it is looked for on use, not decided here (#87).
+    let runtime = arg_value(&args, "--runtime").map(|program| RuntimeSpec {
+        program: PathBuf::from(program),
+        args: arg_values(&args, "--runtime-arg"),
+        env: Vec::new(),
+    });
+    let bash = arg_value(&args, "--bash").map(PathBuf::from);
     let install = arg_value(&args, "--install")
         .map(PathBuf::from)
         .unwrap_or_else(|| managed.clone());
     let events = jouzu_host::events::EventHub::new();
+    let control_node = runtime
+        .as_ref()
+        .map(|spec| spec.program.clone())
+        .unwrap_or_else(|| RuntimeSpec::managed_node(&managed));
     let control = match jouzu_host::control::ControlManager::new(
         &install,
         &managed,
-        runtime.as_ref().map(|spec| spec.program.clone()),
+        Some(control_node),
         &runtime_home,
         Some(events.clone()),
     ) {
@@ -116,14 +119,24 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let sessions = std::sync::Arc::new(SessionManager::new(
-        runtime,
-        home.clone(),
-        runtime_home,
-        bash,
-        jouzu_host::session::DEFAULT_REPLAY_LIMIT,
-        Some(events.clone()),
-    ));
+    let sessions = std::sync::Arc::new(match runtime {
+        Some(spec) => SessionManager::new(
+            Some(spec),
+            home.clone(),
+            runtime_home,
+            bash.or_else(|| find_bash(&managed)),
+            jouzu_host::session::DEFAULT_REPLAY_LIMIT,
+            Some(events.clone()),
+        ),
+        None => SessionManager::managed(
+            managed.clone(),
+            home.clone(),
+            runtime_home,
+            bash,
+            jouzu_host::session::DEFAULT_REPLAY_LIMIT,
+            Some(events.clone()),
+        ),
+    });
     // Start a runtime now, while the window shows loading, not when the user
     // sends the first message.
     sessions.enable_warm_runtime();

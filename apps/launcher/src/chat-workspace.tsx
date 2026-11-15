@@ -399,7 +399,12 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
   // attached and its history shown) or failed; a failure is shown in the chat.
   // A new entry session needs a warm runtime for its first message; an existing one
   // has its own runtime once open, so it does not wait for the pool.
-  useEffect(() => { onBootChange?.(!chatUnavailable && (!snapshot.connected || entryOpening || (!entryExisting && warmBlocks(warm))), warm, retryWarm); }, [snapshot.connected, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
+  // A connection that failed (a lease refused with an error) has nothing left to
+  // wait for: loading ends so the chat shows the error and its retry (issue #87).
+  useEffect(() => {
+    const failed = !snapshot.connected && !!snapshot.error;
+    onBootChange?.(!chatUnavailable && !failed && (!snapshot.connected || entryOpening || (!entryExisting && warmBlocks(warm))), warm, retryWarm);
+  }, [snapshot.connected, snapshot.error, onBootChange, chatUnavailable, warm, entryOpening, entryExisting]);
   useEffect(() => {
     const target = entryTarget.current;
     if (!entryAttaching || !target) return;

@@ -132,11 +132,17 @@ pub struct RuntimeSpec {
 }
 
 impl RuntimeSpec {
+    /// The Node the managed runtime runs on: `JOUZU_HOST_NODE` when set, else
+    /// the bundled one under the managed directory. It may not exist yet.
+    pub fn managed_node(managed: &Path) -> PathBuf {
+        std::env::var_os("JOUZU_HOST_NODE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| managed.join("runtime").join("node").join("node.exe"))
+    }
+
     /// The provisioned runtime rooted at the managed directory.
     pub fn from_managed(managed: &Path) -> Option<Self> {
-        let node = std::env::var_os("JOUZU_HOST_NODE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| managed.join("runtime").join("node").join("node.exe"));
+        let node = Self::managed_node(managed);
         let bootstrap = managed.join("app").join("bootstrap.mjs");
         if !node.is_file() || !bootstrap.is_file() {
             return None;
@@ -167,6 +173,10 @@ pub struct SessionConfig {
     pub home: PathBuf,
     pub runtime_home: PathBuf,
     pub bash: Option<PathBuf>,
+    /// The managed install the runtime came from. Without a fixed `bash`, Git
+    /// Bash is looked up under it at each spawn: the first-run install adds Git
+    /// after Node and the app, so a lookup when the runtime is found can be too early.
+    pub managed: Option<PathBuf>,
     pub replay_limit: usize,
     pub events: Option<Arc<crate::events::EventHub>>,
     /// The runtime started ahead of need, shared by every session.
@@ -214,8 +224,12 @@ impl SessionConfig {
         if let Some(id) = session_id {
             set("JOUZU_HOST_SESSION_ID", OsString::from(id));
         }
-        if let Some(bash) = &self.bash {
-            set("JOUZU_LAUNCHER_BASH", bash.as_os_str().to_os_string());
+        let bash = self
+            .bash
+            .clone()
+            .or_else(|| self.managed.as_deref().and_then(find_bash));
+        if let Some(bash) = bash {
+            set("JOUZU_LAUNCHER_BASH", bash.into_os_string());
         }
         if let Some(path) = session_path {
             set("JOUZU_SESSION_PATH", OsString::from(path));
@@ -4564,7 +4578,15 @@ fn same_session_file(left: &str, right: &str) -> bool {
 }
 
 pub struct SessionManager {
-    config: Option<SessionConfig>,
+    /// How runtimes are started. Kept from the moment the runtime is found; see
+    /// `config()`.
+    config: std::sync::OnceLock<SessionConfig>,
+    /// Set when the runtime is the managed install, which the desktop's first-run
+    /// preparation creates after the host has started. `config()` then looks for
+    /// it on use instead of the host deciding once, at start, that it is missing.
+    managed: Option<ManagedRuntime>,
+    /// `enable_warm_runtime` was asked for; the pool starts when the runtime is found.
+    warm_wanted: AtomicBool,
     home: PathBuf,
     runtime_home: PathBuf,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -4575,6 +4597,13 @@ pub struct SessionManager {
     /// left open does not keep a runtime alive for every session it visited.
     holders: Mutex<HashMap<String, Holder>>,
     persisted_cache: Mutex<Option<Vec<Value>>>,
+}
+
+struct ManagedRuntime {
+    root: PathBuf,
+    bash: Option<PathBuf>,
+    replay_limit: usize,
+    events: Option<Arc<crate::events::EventHub>>,
 }
 
 #[derive(Default)]
@@ -4619,17 +4648,23 @@ impl SessionManager {
         replay_limit: usize,
         events: Option<Arc<crate::events::EventHub>>,
     ) -> Self {
-        let config = spec.map(|spec| SessionConfig {
-            spec,
-            home: home.clone(),
-            runtime_home: runtime_home.clone(),
-            bash,
-            replay_limit,
-            events,
-            warm: Arc::new(std::sync::OnceLock::new()),
-        });
+        let config = std::sync::OnceLock::new();
+        if let Some(spec) = spec {
+            let _ = config.set(SessionConfig {
+                spec,
+                home: home.clone(),
+                runtime_home: runtime_home.clone(),
+                bash,
+                managed: None,
+                replay_limit,
+                events,
+                warm: Arc::new(std::sync::OnceLock::new()),
+            });
+        }
         Self {
             config,
+            managed: None,
+            warm_wanted: AtomicBool::new(false),
             home,
             runtime_home,
             sessions: Mutex::new(HashMap::new()),
@@ -4639,13 +4674,67 @@ impl SessionManager {
         }
     }
 
+    /// A manager for the managed runtime under `managed` (`runtime\node` and
+    /// `app\bootstrap.mjs`). On a first launch the desktop starts the host
+    /// before it installs that runtime, so the runtime is looked for on use and
+    /// picked up as soon as it exists, without a host restart (issue #87). A
+    /// fixed `bash` is used as given; otherwise Git Bash is looked up at each spawn.
+    pub fn managed(
+        managed: PathBuf,
+        home: PathBuf,
+        runtime_home: PathBuf,
+        bash: Option<PathBuf>,
+        replay_limit: usize,
+        events: Option<Arc<crate::events::EventHub>>,
+    ) -> Self {
+        let mut manager = Self::new(None, home, runtime_home, None, replay_limit, None);
+        manager.managed = Some(ManagedRuntime { root: managed, bash, replay_limit, events });
+        manager
+    }
+
+    /// How runtimes are started, or `None` while the managed runtime is not
+    /// installed. Once found it is kept for the life of the host: an update
+    /// replaces the files in place (after stopping sessions), it does not move them.
+    fn config(&self) -> Option<&SessionConfig> {
+        if let Some(config) = self.config.get() {
+            return Some(config);
+        }
+        let managed = self.managed.as_ref()?;
+        let spec = RuntimeSpec::from_managed(&managed.root)?;
+        let mut found = false;
+        let config = self.config.get_or_init(|| {
+            found = true;
+            SessionConfig {
+                spec,
+                home: self.home.clone(),
+                runtime_home: self.runtime_home.clone(),
+                bash: managed.bash.clone(),
+                managed: Some(managed.root.clone()),
+                replay_limit: managed.replay_limit,
+                events: managed.events.clone(),
+                warm: Arc::new(std::sync::OnceLock::new()),
+            }
+        });
+        if found {
+            log(
+                &self.home,
+                "info",
+                "runtime.found",
+                json!({ "program": config.spec.program.to_string_lossy() }),
+            );
+            if self.warm_wanted.load(Ordering::SeqCst) {
+                Self::start_warm(config);
+            }
+        }
+        Some(config)
+    }
+
     pub fn runtime_home(&self) -> &Path {
         &self.runtime_home
     }
 
     pub fn node_executable(&self) -> Option<PathBuf> {
-        self.config
-            .as_ref()
+        self.config()
             .map(|config| config.spec.program.clone())
     }
 
@@ -5604,7 +5693,7 @@ impl SessionManager {
                 sessions.remove(&existing.id);
             }
         }
-        let config = self.config.clone().ok_or_else(|| {
+        let config = self.config().cloned().ok_or_else(|| {
             // Without a `--runtime`, the host runs the bundled Node and app; say
             // which one is missing rather than falling back to anything else.
             let managed = self.runtime_home.parent().unwrap_or(&self.home);
@@ -5685,9 +5774,20 @@ impl SessionManager {
     }
 
     /// Keep one runtime started ahead of need. Called once by the host binary;
-    /// tests opt in explicitly.
+    /// tests opt in explicitly. While the managed runtime is not installed, the
+    /// pool starts as soon as it is found (see `config()`).
     pub fn enable_warm_runtime(&self) -> Option<Arc<WarmPool>> {
-        let config = self.config.clone()?;
+        let known = self.config.get().is_some();
+        self.warm_wanted.store(true, Ordering::SeqCst);
+        if !known {
+            // Finding the runtime starts the pool.
+            return self.config().and_then(|config| config.warm.get().cloned());
+        }
+        Some(Self::start_warm(self.config.get()?))
+    }
+
+    fn start_warm(config: &SessionConfig) -> Arc<WarmPool> {
+        let config = config.clone();
         let scratch = WarmPool::scratch(&config.home);
         let events = config.events.clone();
         let spawn = config.clone();
@@ -5718,7 +5818,7 @@ impl SessionManager {
         log(&config.home, "info", "runtime.warm_start", pool.status());
         // The app is starting and its loading screen waits for this runtime.
         pool.hurry();
-        Some(pool.clone())
+        pool.clone()
     }
 
     /// How to spell `workspace` for a runtime and a new session header. Pi
@@ -5744,7 +5844,7 @@ impl SessionManager {
     }
 
     pub fn warm_runtime(&self) -> Option<Arc<WarmPool>> {
-        self.config.as_ref().and_then(|config| config.warm.get().cloned())
+        self.config.get().and_then(|config| config.warm.get().cloned())
     }
 
     pub fn stop_all(&self) {
@@ -6018,6 +6118,7 @@ mod environment_tests {
             home: runtime_home.to_path_buf(),
             runtime_home: runtime_home.to_path_buf(),
             bash: None,
+            managed: None,
             replay_limit: DEFAULT_REPLAY_LIMIT,
             events: None,
             warm: Arc::new(std::sync::OnceLock::new()),
