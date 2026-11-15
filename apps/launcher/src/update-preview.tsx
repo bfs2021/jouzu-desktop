@@ -12,7 +12,7 @@ const labels: Record<Locale, {
   title: string; description: string; check: string; launcher: string; currentVersion: string;
   available: string; availableTag: string; upToDate: string; updateJouzu: string; updateLauncher: string;
   checking: string; downloading: string; installing: string; updated: string;
-  checkFailed: string; retry: string; restart: string; cancel: string; unavailable: string;
+  checkFailed: string; installFailed: string; retry: string; restart: string; cancel: string; unavailable: string;
   channel: string; stable: string; qa: string; qaHint: string; back: string;
 }> = {
   en: {
@@ -20,7 +20,7 @@ const labels: Record<Locale, {
     launcher: 'Launcher', currentVersion: 'Current version', available: 'Available', availableTag: 'Update available', upToDate: 'Up to date',
     updateJouzu: 'Update Jouzu', updateLauncher: 'Update and restart', checking: 'Checking…',
     downloading: 'Downloading…', installing: 'Installing…', updated: 'Updated',
-    checkFailed: 'Could not check for updates', retry: 'Retry',
+    checkFailed: 'Could not check for updates', installFailed: 'Could not install the update', retry: 'Retry',
     restart: 'The launcher restarts after updating.', cancel: 'Cancel',
     unavailable: 'Online updates are unavailable for this version.',
     channel: 'Update channel', stable: 'Stable', qa: 'QA (test builds)', qaHint: 'QA updates this installation in place and keeps your data. Switch back to Stable at any time.', back: 'Back to Stable (older than this build)',
@@ -30,7 +30,7 @@ const labels: Record<Locale, {
     launcher: 'ランチャー', currentVersion: '現在のバージョン', available: '更新先', availableTag: '更新があります', upToDate: '最新です',
     updateJouzu: 'Jouzu を更新', updateLauncher: '更新して再起動', checking: '確認中…',
     downloading: 'ダウンロード中…', installing: 'インストール中…', updated: '更新しました',
-    checkFailed: '更新を確認できませんでした', retry: '再試行',
+    checkFailed: '更新を確認できませんでした', installFailed: '更新をインストールできませんでした', retry: '再試行',
     restart: '更新後にランチャーを再起動します。', cancel: 'キャンセル',
     unavailable: 'このバージョンではオンライン更新を利用できません。',
     channel: '更新チャネル', stable: '安定版', qa: 'QA（テスト版）', qaHint: 'QA はこのインストールをそのまま更新し、データも引き継ぎます。いつでも安定版に戻せます。', back: '安定版に戻す（このビルドより古い版）',
@@ -40,7 +40,7 @@ const labels: Record<Locale, {
     launcher: '启动器', currentVersion: '当前版本', available: '可更新至', availableTag: '有可用更新', upToDate: '已是最新',
     updateJouzu: '更新 Jouzu', updateLauncher: '更新并重启', checking: '正在检查…',
     downloading: '正在下载…', installing: '正在安装…', updated: '更新完成',
-    checkFailed: '暂时无法检查更新', retry: '重试',
+    checkFailed: '暂时无法检查更新', installFailed: '更新未能安装', retry: '重试',
     restart: '更新后将重新启动启动器。', cancel: '取消',
     unavailable: '此版本暂不支持在线更新。',
     channel: '更新通道', stable: '正式版', qa: 'QA（测试版）', qaHint: 'QA 在原安装上直接升级，沿用你的数据。可随时切回正式版。', back: '切回正式版（比当前版本旧）',
@@ -50,7 +50,7 @@ const labels: Record<Locale, {
     launcher: '啟動器', currentVersion: '目前版本', available: '可更新至', availableTag: '有可用更新', upToDate: '已是最新',
     updateJouzu: '更新 Jouzu', updateLauncher: '更新並重新啟動', checking: '正在檢查…',
     downloading: '正在下載…', installing: '正在安裝…', updated: '更新完成',
-    checkFailed: '暫時無法檢查更新', retry: '重試',
+    checkFailed: '暫時無法檢查更新', installFailed: '更新未能安裝', retry: '重試',
     restart: '更新後將重新啟動啟動器。', cancel: '取消',
     unavailable: '此版本暫不支援線上更新。',
     channel: '更新通道', stable: '正式版', qa: 'QA（測試版）', qaHint: 'QA 在原安裝上直接升級，沿用你的資料。可隨時切回正式版。', back: '切回正式版（比目前版本舊）',
@@ -116,7 +116,8 @@ export function UpdatePreview({ locale, live, focusIndex }: { locale: Locale; li
         {['available', 'complete'].includes(phase) && (live.notes[index]
           ? <div className="max-h-40 overflow-auto rounded-md bg-muted/40 p-2"><p className="text-xs font-medium">{noteText[locale][0]}</p><ul className="mt-1 space-y-1">{noteItems(live.notes[index])}</ul>{live.sources[index] && <p className="mt-1 text-[10px] text-muted-foreground/70">{noteText[locale][1]} {live.sources[index]}</p>}</div>
           : <p className="text-xs text-muted-foreground">{noteText[locale][2]}</p>)}
-        {phase === 'error' && <ErrorLine raw={live.errors[index] ?? ""} failed={t.checkFailed} />}
+        {/* A row with a target failed while installing it; one without failed to check. */}
+        {phase === 'error' && <ErrorLine raw={live.errors[index] ?? ""} failed={live.targets[index] ? t.installFailed : t.checkFailed} />}
         {(phase === 'downloading' || phase === 'installing') && <Progress value={phase === 'downloading' ? live.progress : undefined} />}
       </div>
     </section>)}</div>
