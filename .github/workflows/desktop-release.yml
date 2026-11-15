@@ -10,10 +10,11 @@ name: Desktop release
 # published feed. Runtime provisioning is still open (0065); until it lands a
 # shell-only release cannot start chat on a clean machine.
 #
-# Every build ships on QA first. `publish` is the only path that writes to the
-# repository: it creates the prerelease `v<version>` and replaces the QA feed on the
-# `desktop-update-qa` release. It never touches the stable feed; that is
-# desktop-promote.yml, which points stable at the same signed asset after QA.
+# This workflow publishes QA release candidates (X.Y.Z-rc.N) with the QA icon. `publish`
+# is the only path that writes to the repository: it creates the prerelease `v<version>`
+# and replaces the QA feed on the `desktop-update-qa` release. It never touches the stable
+# feed; that is desktop-stable.yml, which builds X.Y.Z again from a candidate's commit and
+# runs the full playbook before publishing (#86).
 # Both feeds only move forward: release-guard.mjs refuses a version that is not newer
 # than what either feed serves, and a tag that already exists is never replaced.
 # Without `publish`, the run only proves the build and keeps a workflow artifact.
@@ -154,7 +155,10 @@ jobs:
           # This workflow builds QA packages, and a QA package carries the QA icon (#74):
           # the executable, installer, window, taskbar and tray all show the badge. The
           # icon is the only packaging difference; the update channel stays a setting.
-          $bundle = @{ icon = @('icons/qa/32x32.png', 'icons/qa/128x128.png', 'icons/qa/128x128@2x.png', 'icons/qa/icon.icns', 'icons/qa/icon.ico') }
+          $bundle = @{
+            icon = @('icons/qa/32x32.png', 'icons/qa/128x128.png', 'icons/qa/128x128@2x.png', 'icons/qa/icon.icns', 'icons/qa/icon.ico')
+            windows = @{ nsis = @{ installerIcon = 'icons/qa/icon.ico' } }
+          }
           if ('${{ inputs.publish }}' -eq 'true') {
             # createUpdaterArtifacts is a build-time overlay, so the release always
             # produces the .sig the feed points at.
