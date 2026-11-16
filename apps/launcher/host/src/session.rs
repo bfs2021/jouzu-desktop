@@ -397,6 +397,40 @@ fn reply_blocks(message: &Value) -> Vec<Value> {
     blocks
 }
 
+/// Where a history image's bytes are: a file the host stored when the message
+/// was sent, or the image block of the saved session file it was read from.
+#[derive(Clone)]
+enum AttachmentSource {
+    File { path: PathBuf, mime_type: String },
+    Saved { mime_type: String, data: Arc<str> },
+}
+
+/// The images of a saved user message, with the ids its history row gives them.
+/// The id is the message's place in the file, so it is the same on every import.
+fn saved_images(message: &Value, index: usize) -> Vec<(String, String, String)> {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|block| {
+            let mime_type = block.get("mimeType").and_then(Value::as_str)?;
+            let data = block.get("data").and_then(Value::as_str)?;
+            (mime_type.starts_with("image/") && !data.is_empty())
+                .then(|| (mime_type.to_string(), data.to_string()))
+        })
+        .enumerate()
+        .map(|(number, (mime_type, data))| (format!("saved-{index}-{number}"), mime_type, data))
+        .collect()
+}
+
+/// Decoded size of base64 data.
+fn base64_len(data: &str) -> usize {
+    let padding = data.bytes().rev().take_while(|byte| *byte == b'=').count().min(2);
+    (data.len() / 4 * 3).saturating_sub(padding)
+}
+
 /// What a tool that never finished shows: it was cut off, not still running.
 fn interrupted_result() -> Value {
     json!({ "content": [{ "type": "text", "text": "Interrupted" }] })
@@ -603,6 +637,9 @@ pub struct Session {
     runtime_home: PathBuf,
     history: Mutex<Vec<Value>>,
     history_seq: AtomicU64,
+    /// Where the images of the user's messages in `history` are: a history row
+    /// names an image by id only, and clients fetch it by that id (#119).
+    attachments: Mutex<HashMap<String, AttachmentSource>>,
     assistant_text: Mutex<String>,
     assistant_blocks: Mutex<Vec<Value>>,
     step: Mutex<StepState>,
@@ -2105,6 +2142,8 @@ impl Session {
             return;
         };
         let mut rows = Vec::new();
+        let mut saved_attachments = Vec::new();
+        let mut attachment_refs = Vec::new();
         for (index, message) in messages.iter().enumerate() {
             let role = message
                 .get("role")
@@ -2138,6 +2177,7 @@ impl Session {
                 continue;
             }
             let blocks = reply_blocks(message);
+            let images = if role == "user" { saved_images(message, index) } else { Vec::new() };
             let text = blocks
                 .iter()
                 .filter_map(|block| {
@@ -2149,7 +2189,8 @@ impl Session {
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            if text.is_empty() && blocks.is_empty() {
+            // A message of only an image is still a message (#119).
+            if text.is_empty() && blocks.is_empty() && images.is_empty() {
                 continue;
             }
             let blocks = if blocks.is_empty() {
@@ -2157,6 +2198,25 @@ impl Session {
             } else {
                 Value::Array(blocks)
             };
+            if !images.is_empty() {
+                // Same shape as a row the host wrote when the message was sent.
+                let refs: Vec<Value> = images
+                    .iter()
+                    .enumerate()
+                    .map(|(number, (id, mime_type, data))| {
+                        json!({
+                            "id": id,
+                            "name": format!("image-{}", number + 1),
+                            "mimeType": mime_type,
+                            "bytes": base64_len(data),
+                        })
+                    })
+                    .collect();
+                saved_attachments.extend(images.into_iter().map(|(id, mime_type, data)| {
+                    (id, AttachmentSource::Saved { mime_type, data: Arc::from(data) })
+                }));
+                attachment_refs.push((rows.len(), refs));
+            }
             rows.push(json!({
                 "kind": role,
                 "id": message
@@ -2184,6 +2244,16 @@ impl Session {
         }
         if rows.is_empty() {
             return;
+        }
+        for (row, refs) in attachment_refs {
+            rows[row]["attachments"] = json!(refs);
+        }
+        {
+            // The saved file's images replace those of an earlier import; images
+            // sent in this run stay, as their rows may still be on screen.
+            let mut attachments = self.attachments.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            attachments.retain(|_, source| matches!(source, AttachmentSource::File { .. }));
+            attachments.extend(saved_attachments);
         }
         // A saved conversation is at rest: a tool call with no result was cut off
         // (the app closed, the runtime stopped). While a turn runs, its own calls
@@ -3120,15 +3190,42 @@ impl Session {
             let path = directory.join(format!("{id}.{extension}"));
             std::fs::write(&path, &bytes)
                 .map_err(|error| ApiError::internal(format!("Could not store attachment: {error}")))?;
+            // The row names the image by id; where it is stored stays in the host.
             stored.push(json!({
                 "id": id,
                 "name": attachment.name,
                 "mimeType": attachment.mime_type,
                 "bytes": bytes.len(),
-                "path": path.to_string_lossy(),
             }));
+            self.attachments
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id, AttachmentSource::File { path, mime_type: attachment.mime_type.clone() });
         }
         Ok(stored)
+    }
+
+    /// An image of a user message in this session's history, by the id its
+    /// history row gives it: its type and base64 data.
+    pub fn attachment(&self, id: &str) -> Result<(String, String), ApiError> {
+        let source = self
+            .attachments
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::new(axum::http::StatusCode::NOT_FOUND, "attachment-not-found", "No such attachment", false)
+            })?;
+        match source {
+            AttachmentSource::File { path, mime_type } => {
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    ApiError::internal(format!("Could not read attachment: {error}"))
+                })?;
+                Ok((mime_type, STANDARD.encode(bytes)))
+            }
+            AttachmentSource::Saved { mime_type, data } => Ok((mime_type, data.to_string())),
+        }
     }
 
     pub fn send(self: &Arc<Self>, client_message_id: &str, text: &str) -> Result<Value, ApiError> {
@@ -4116,6 +4213,7 @@ impl Session {
             runtime_home: config.runtime_home.clone(),
             history: Mutex::new(Vec::new()),
             history_seq: AtomicU64::new(0),
+            attachments: Mutex::new(HashMap::new()),
             assistant_text: Mutex::new(String::new()),
             assistant_blocks: Mutex::new(Vec::new()),
             step: Mutex::new(StepState::new()),

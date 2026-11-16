@@ -331,6 +331,12 @@ export class HostClient {
     );
   }
 
+  attachment(sessionId: string, attachmentId: string): Promise<{ mimeType: string; data: string }> {
+    return this.request<{ mimeType: string; data: string }>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(attachmentId)}`,
+    );
+  }
+
   messages(sessionPath: string, page: { limit?: number; before?: number } = {}): Promise<SavedMessagesPage> {
     const query = new URLSearchParams({ sessionPath });
     if (page.limit) query.set("limit", String(page.limit));

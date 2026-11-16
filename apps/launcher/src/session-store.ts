@@ -369,7 +369,7 @@ export class SessionStore {
         if (row.partial === true) active = messageIndex;
       }
       this.active = active;
-      const projection = historyRowsProjection(rows);
+      const projection = historyRowsProjection(rows, this.session.id);
       this.update({
         projection: { ...projection, running: this.running, turnStartedAt: this.state.activeTurn?.startedAt ?? this.state.projection.turnStartedAt, activeMessage: active >= 0 ? active : null },
         historyError: undefined,
@@ -395,7 +395,7 @@ export class SessionStore {
       const page = await this.session.history({ limit: HISTORY_PAGE, before });
       if (generation !== this.historyGeneration || this.disposed) return;
       const rows = [...(page.messages as unknown as Data[])].reverse().filter(row => row.partial !== true);
-      const earlier = historyRowsProjection(rows);
+      const earlier = historyRowsProjection(rows, this.session.id);
       if (this.active >= 0) this.active += earlier.messages.length;
       this.earlier = page.nextBefore;
       this.loadedRows += rows.length;
@@ -813,13 +813,15 @@ export class SessionStore {
         break;
       case "message.user": {
         // A waiting message the runtime used: it joins the conversation where it happened.
-        const message = historyRowsProjection([data]).messages[0];
+        const message = historyRowsProjection([data], this.session.id).messages[0];
         if (!message) break;
         const id = text(data.clientMessageId);
         const images = id ? this.waitingImages.get(id) : undefined;
         if (id) this.waitingImages.delete(id);
-        const content = images?.length && !message.content.some(block => block.type === "image")
-          ? [...message.content, ...images.map(image => ({ type: "image", data: image.data, mimeType: image.mimeType }))]
+        // The images this client sent are already here; the host's references to
+        // the same images are fetched only by clients that do not have them.
+        const content = images?.length
+          ? [...message.content.filter(block => block.type !== "image" || !block.attachment), ...images.map(image => ({ type: "image", data: image.data, mimeType: image.mimeType }))]
           : message.content;
         const current = this.state.projection.messages;
         const at = this.active >= 0 && this.active === current.length - 1 ? this.active : current.length;

@@ -91,6 +91,16 @@ describe("SessionStore", () => {
     expect(session.requests.map(request => request.before)).toEqual([undefined, 191]);
   });
 
+  it("keeps the image references of messages on an earlier page", async () => {
+    const session = longSession(130);
+    Object.assign(session.rows[0], { attachments: [{ id: "img-1", mimeType: "image/png" }] });
+    const store = SessionStore.attach(session);
+    await store.loadHistory();
+    await store.loadEarlier();
+    const first = store.snapshot.projection.messages[0];
+    expect(first.content.find(block => block.type === "image")?.attachment).toEqual({ sessionId: "s-test", id: "img-1" });
+  });
+
   it("keeps the earlier pages it loaded when the host replaces the history", async () => {
     const session = longSession(130);
     const store = SessionStore.attach(session);
@@ -402,6 +412,37 @@ describe("SessionStore", () => {
     expect(messages.map(message => message.role)).toEqual(["assistant", "user", "assistant"]);
     expect(messages[1].content).toEqual([{ type: "text", text: "also check the tests" }, image]);
     expect(store.snapshot.queue).toEqual([]);
+  });
+
+  it("keeps a message's images when the transcript is rebuilt from host history (#119)", async () => {
+    const session = fakeSession();
+    session.history = async () => ({
+      messages: [
+        { cursor: 2, id: "saved-2", kind: "user", text: "", blocks: [{ type: "text", text: "" }], attachments: [{ id: "saved-2-0", name: "image-1", mimeType: "image/png", bytes: 3 }] },
+        { cursor: 1, id: "m-1:user", kind: "user", text: "what is this?", blocks: [{ type: "text", text: "what is this?" }], attachments: [{ id: "att-1", name: "image-1", mimeType: "image/webp", bytes: 3 }] },
+      ],
+      nextBefore: null,
+    }) as unknown as HistoryPage;
+    const store = SessionStore.attach(session);
+    await store.loadHistory();
+    const [withText, imageOnly] = store.snapshot.projection.messages;
+    expect(withText.content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image", mimeType: "image/webp", attachment: { sessionId: "s-test", id: "att-1" } },
+    ]);
+    expect(imageOnly.content.filter(block => block.type === "image")).toEqual([
+      { type: "image", mimeType: "image/png", attachment: { sessionId: "s-test", id: "saved-2-0" } },
+    ]);
+  });
+
+  it("shows its own copy of a waiting image instead of the host's reference to it", async () => {
+    const session = fakeSession();
+    session.send = async message => { session.sent.push(message); return { messageId: "m-2", receipt: "queued", waiting: true }; };
+    const store = SessionStore.attach(session);
+    const image = { type: "image" as const, data: "AAEC", mimeType: "image/png" as const };
+    await store.send("look", [image], "c-2");
+    session.emit(event(1, "message.user", { kind: "user", id: "m-2:user", turnId: "m-1", clientMessageId: "c-2", text: "look", blocks: [{ type: "text", text: "look" }], attachments: [{ id: "att-9", name: "image-1", mimeType: "image/png", bytes: 3 }] }));
+    expect(store.snapshot.projection.messages[0].content).toEqual([{ type: "text", text: "look" }, image]);
   });
 
   it("gives a waiting message back for editing and removes it from the queue", async () => {

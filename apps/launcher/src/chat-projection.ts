@@ -1,7 +1,9 @@
 // Presentation-only projection of the released JSONL event contract.
 // Agent history and completion remain authoritative in the runtime.
 export type WireObject = Record<string, unknown>;
-export interface ChatBlock { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown; data?: string; mimeType?: string; content?: ChatBlock[]; toolCallId?: string; isError?: boolean }
+/** An image the host keeps for a message in history: fetched by id, never inlined in the row. */
+export interface HostAttachmentRef { sessionId: string; id: string }
+export interface ChatBlock { type: string; text?: string; thinking?: string; id?: string; name?: string; arguments?: unknown; data?: string; mimeType?: string; attachment?: HostAttachmentRef; content?: ChatBlock[]; toolCallId?: string; isError?: boolean }
 export interface ChatMessage { role: string; content: ChatBlock[]; turnId?: string; /** The user turn this message belongs to (1 = the first user message), as the host numbers it. */ turn?: number; details?: unknown; timestamp?: number; endedAt?: number; stopReason?: string; errorMessage?: string; toolCallId?: string; toolName?: string; isError?: boolean; provider?: string; model?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number; totalTokens?: number } }
 export interface ToolView { id: string; name: string; args: unknown; phase: "running" | "complete" | "error"; result?: unknown; interrupted?: boolean }
 export interface FlowReportRecord { kind: string; text: string; timestamp?: number }
@@ -97,15 +99,22 @@ export function hostToolResults(blocks: unknown, known: Record<string, ToolView>
   return results;
 }
 
-/** Images the user attached, as stored by the host with the user row. */
-function attachmentBlocks(attachments: unknown): ChatBlock[] {
+/**
+ * Images the user attached, as the host lists them on the user row. A row names
+ * each image by id (no data); the transcript fetches it from the host (#119).
+ */
+function attachmentBlocks(attachments: unknown, sessionId?: string): ChatBlock[] {
   if (!Array.isArray(attachments)) return [];
-  return attachments.flatMap((item): ChatBlock[] => object(item) && typeof item.data === "string" && typeof item.mimeType === "string" && item.mimeType.startsWith("image/")
-    ? [{ type: "image", data: item.data, mimeType: item.mimeType }]
-    : []);
+  return attachments.flatMap((item): ChatBlock[] => {
+    if (!object(item) || typeof item.mimeType !== "string" || !item.mimeType.startsWith("image/")) return [];
+    if (typeof item.data === "string") return [{ type: "image", data: item.data, mimeType: item.mimeType }];
+    if (typeof item.id === "string" && item.id && sessionId) return [{ type: "image", mimeType: item.mimeType, attachment: { sessionId, id: item.id } }];
+    return [];
+  });
 }
 
-export function historyRowsProjection(rows: unknown): ChatProjection {
+/** Host history rows as the transcript; `sessionId` is the host session the rows (and their images) belong to. */
+export function historyRowsProjection(rows: unknown, sessionId?: string): ChatProjection {
   if (!Array.isArray(rows)) throw new Error("Invalid host history");
   const messages: ChatMessage[] = [];
   const tools: Record<string, ToolView> = {};
@@ -114,7 +123,7 @@ export function historyRowsProjection(rows: unknown): ChatProjection {
     const kind = typeof row.kind === "string" ? row.kind : "";
     const timestamp = typeof row.createdAt === "string" ? Date.parse(row.createdAt) : undefined;
     if (kind === "user" || kind === "assistant") {
-      const content = [...hostBlocks(row.blocks), ...attachmentBlocks(row.attachments)];
+      const content = [...hostBlocks(row.blocks), ...attachmentBlocks(row.attachments, sessionId)];
       messages.push({
         role: kind,
         content,
