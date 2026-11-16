@@ -56,7 +56,7 @@ cargo run --manifest-path host/Cargo.toml -- --dist dist --home <host home> `
 | --- | --- | --- |
 | `--dist` | Built UI to serve | `./dist` |
 | `--home` | The Desktop installation: `host.json`, `host.lock`, `logs/`, and the installed runtime (`runtime/node`, `app`) | `JOUZU_HOST_HOME`, then `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop` |
-| `--runtime-home` | `JOUZU_HOME` given to the runtime (sessions, settings, credentials). Jouzu owns this folder, not Desktop, and the host never copies it | `JOUZU_HOME`, else `%LOCALAPPDATA%\Shisa.ai\Jouzu\data` on Windows (the runtime's own default), else `<home>/data` |
+| `--runtime-home` | `JOUZU_HOME` given to the runtime (sessions, settings, credentials). The host never copies or moves it | `JOUZU_HOME`, else `<home>/data` |
 | `--runtime`, `--runtime-arg` | Runtime program and arguments | the runtime installed under `--home`, looked up when a session starts |
 | `--bash` | Git Bash to give the runtime | discovered |
 
