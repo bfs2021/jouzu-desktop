@@ -184,7 +184,8 @@ to reproduce, and the relevant part of `logs/` or the crash record if there is o
 API keys.
 
 Pull requests target `develop`; `main` holds released code only. A bug gets an issue before it
-gets a fix, the fix names the root cause, and every closed issue gets a regression check.
+gets a fix, the fix names the root cause, and every closed issue gets a regression check. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## License
 
