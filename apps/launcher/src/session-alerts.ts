@@ -101,9 +101,9 @@ export function sessionAlerts(input: SessionAlertInputs, on: SessionAlertHandler
     alerts.push({
       id: "image",
       level: "error",
-      text: "This session contains an image the model refuses, so every request fails. Removing it keeps the rest of the conversation.",
+      text: "The model rejected a request because of an image in this conversation. Images stay in the history and are sent again with every message, so the next message fails the same way. Remove the images to continue; the text of the conversation is kept.",
       details: errors.find(isImageRefused),
-      actions: [{ label: "Remove the image", run: on.removeRefusedImage, disabled: busy }],
+      actions: [{ label: "Remove images", run: on.removeRefusedImage, disabled: busy }, { label: "New session", run: on.newSession }],
     });
   }
   if (input.historyError) {

@@ -73,8 +73,29 @@ describe("sessionAlerts", () => {
     const on = handlers();
     const alerts = sessionAlerts({ replyError: "400 image must be larger than 10x10 pixels" }, on);
     expect(alerts.map(alert => alert.id)).toEqual(["image"]);
+    expect(alerts[0].actions.map(action => action.label)).toEqual(["Remove images", "New session"]);
     alerts[0].actions[0].run();
     expect(on.removeRefusedImage).toHaveBeenCalled();
+  });
+
+  it("offers the image repair for any refusal that blames an image (#17)", () => {
+    const refusals = [
+      // The provider text from #17: no "minimum", "too small" or "below" in it.
+      '400: {"code":"invalid_parameter_error","message":"The image length and width do not meet the model restrictions. [height:1 or width:256 must be larger than 10]","type":"invalid_request_error"}',
+      "400 Invalid image_url: unsupported image format",
+      "400 messages.2.content.0.image.source.base64: image exceeds 5 MB maximum",
+      "This model does not support image input",
+    ];
+    for (const replyError of refusals) {
+      const alerts = sessionAlerts({ replyError }, handlers());
+      expect(alerts.map(alert => alert.id)).toEqual(["image"]);
+      expect(alerts[0].details).toBe(replyError);
+    }
+  });
+
+  it("does not offer the image repair for failures that do not name an image", () => {
+    const alerts = sessionAlerts({ replyError: "400 context length exceeded" }, handlers());
+    expect(alerts.map(alert => alert.id)).toEqual(["reply"]);
   });
 
   it("puts a message that was not sent here, with Retry and Discard", () => {
