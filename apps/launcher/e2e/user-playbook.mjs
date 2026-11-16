@@ -54,6 +54,69 @@ async function waitForConversationText(text, timeout = 30_000) {
   await conversation().getByText(text, { exact: true }).first().waitFor({ timeout });
 }
 
+/** A 32×32 solid red PNG, built here so the playbook needs no fixture file. */
+async function redSquarePng() {
+  const { deflateSync } = await import("node:zlib");
+  const table = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = bytes => {
+    let c = 0xffffffff;
+    for (const byte of bytes) c = table[(c ^ byte) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
+    const sum = Buffer.alloc(4); sum.writeUInt32BE(crc(body));
+    return Buffer.concat([length, body, sum]);
+  };
+  const size = 32;
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(size, 0); header.writeUInt32BE(size, 4);
+  header[8] = 8; header[9] = 2; // 8-bit RGB
+  const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(size * 3, Buffer.from([255, 0, 0]))]);
+  const pixels = deflateSync(Buffer.concat(Array.from({ length: size }, () => row)));
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", header), chunk("IDAT", pixels), chunk("IEND", Buffer.alloc(0))]);
+}
+
+/**
+ * An image the user sent stays in its message after switching sessions (#119).
+ * Measures: the message's image is visible again after switching to another
+ * session and back. Why: the transcript shown again is rebuilt from the app's
+ * history, which once had no way to show a message's image. `otherPrompt` is a
+ * visible prompt of another saved session to switch to.
+ */
+async function imageSurvivesSessionSwitch(otherPrompt) {
+  const name = "Image in a sent message stays after switching sessions (#119)";
+  await newSession().click();
+  await composer().waitFor({ timeout: 10_000 });
+  const chooser = page.getByLabel("Choose images", { exact: true });
+  if (!await chooser.count()) {
+    result.scenarios.push({ name, ok: true, skipped: true, detail: "the selected model takes no images" });
+    return;
+  }
+  const imagePrompt = "What color is this square? Reply with one word.";
+  await chooser.setInputFiles({ name: "red-square.png", mimeType: "image/png", buffer: await redSquarePng() });
+  await page.getByRole("list", { name: "Attached images" }).waitFor({ timeout: 10_000 });
+  await composer().fill(imagePrompt);
+  await send().click();
+  await waitForConversationText(imagePrompt, 5_000);
+  await stop().waitFor({ state: "detached", timeout: 60_000 }).catch(() => {});
+  await page.getByRole("button", { name: /^send$/i }).waitFor({ timeout: 60_000 });
+  const sentImage = () => conversation().getByRole("img", { name: "Conversation attachment" }).first();
+  const before = await sentImage().isVisible();
+  await page.getByText(otherPrompt, { exact: false }).first().click();
+  await conversation().getByText(otherPrompt, { exact: false }).first().waitFor({ timeout: 10_000 });
+  await page.getByText(imagePrompt, { exact: true }).first().click();
+  await waitForConversationText(imagePrompt, 10_000);
+  const after = await sentImage().waitFor({ timeout: 10_000 }).then(() => true, () => false);
+  scenario(name, before && after, `visible before switching: ${before}; after switching back: ${after}`);
+  await page.screenshot({ path: process.env.TEMP + "\\playbook-02-image-switch.png" });
+}
+
 /**
  * Image tool with a provider other than Shisa (#65). The provider list comes
  * from the runtime's model catalog, so a provider with a credential in the test
@@ -366,6 +429,7 @@ try {
   await mark("savedSessionSwitch", now() - start);
   assertGate("savedSessionSwitch", now() - start, 2_000);
   scenario("P0-3 reopen saved session", true);
+  await imageSurvivesSessionSwitch("What is 17 × 23");
 
   // Image tool settings (#64, #67). Holds whatever the account can do: a
   // provider is offered only when it lists image models, otherwise the page says

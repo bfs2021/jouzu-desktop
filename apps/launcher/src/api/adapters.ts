@@ -57,6 +57,7 @@ function hostGroups(client: HostClient) {
     history: (sessionId, page) => client.history(sessionId, page),
     messages: (sessionPath, limit) => client.messages(sessionPath, limit),
     sanitizeImages: sessionPath => client.sanitizeSessionImages(sessionPath),
+    attachment: (sessionId, attachmentId) => client.attachment(sessionId, attachmentId),
     send: (sessionId, message) =>
       client.send(sessionId, message.text, message.clientMessageId, message.attachments ?? []),
     async interrupt(sessionId) {

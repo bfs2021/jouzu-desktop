@@ -2,7 +2,7 @@ import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowDown } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { ChatMarkdown } from "./chat-markdown";
-import { MessageImage } from "./message-image";
+import { HostAttachmentImage, MessageImage } from "./message-image";
 import { WorkspaceContext } from "./workspace-context";
 import type { ChatMessage, ChatProjection } from "./chat-projection";
 import type { OutboxItem } from "./chat-types";
@@ -67,6 +67,10 @@ function contentParts(message: ChatMessage, index: number, projection: ChatProje
       }
       return;
     }
+    if (block.type === "image" && block.attachment) {
+      parts.push(<HostAttachmentImage key={position} attachment={block.attachment} alt="Conversation attachment" />);
+      return;
+    }
     if (block.type === "image" && typeof block.data === "string" && ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(block.mimeType ?? "")) {
       parts.push(<MessageImage key={position} kind="block" source={`data:${block.mimeType};base64,${block.data}`} alt="Conversation attachment" />);
       return;
@@ -98,6 +102,7 @@ function contentParts(message: ChatMessage, index: number, projection: ChatProje
 function UserContent({ message }: { message: ChatMessage }) {
   return <>{message.content.map((block, position) => {
     if (block.type === "text") return <ChatMarkdown key={position} text={block.text ?? ""} />;
+    if (block.type === "image" && block.attachment) return <HostAttachmentImage key={position} attachment={block.attachment} alt="Conversation attachment" />;
     if (block.type === "image" && typeof block.data === "string" && ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(block.mimeType ?? "")) {
       return <MessageImage key={position} kind="block" source={`data:${block.mimeType};base64,${block.data}`} alt="Conversation attachment" />;
     }
