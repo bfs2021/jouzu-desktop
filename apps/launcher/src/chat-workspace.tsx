@@ -967,10 +967,13 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
    * one is re-created from its file (the host replaces a stopped session at the
    * same path), a blank one gets a new session. Selection and preview are left as
    * the user set them; this only replaces the dead connection under them.
+   * The same path is the "Restart session" of a session the host gave up on
+   * (#95: status "error"); that one runs only when the user asks.
    */
   async function reopenBoundSession(): Promise<boolean> {
     const stale = connection.current;
-    if (!stale || stale.snapshot.connected || switchingRef.current) return false;
+    // A failed session (#95) still counts as connected, but its host session runs nothing.
+    if (!stale || (stale.snapshot.connected && stale.snapshot.status !== "error") || switchingRef.current) return false;
     const sessionFile = stale.snapshot.sessionFile;
     const saved = !!sessionFile && stale.snapshot.projection.messages.length > 0;
     switchingRef.current = true;
@@ -1390,6 +1393,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     notice: showingAttached && snapshot.notice && snapshot.notice.id !== dismissed.notice ? snapshot.notice : null,
     busy: commandBusy,
   }, {
+    restartSession: () => void reopenBoundSession(),
     retryOpen: selectedSession ? () => { setSessionError(null); startSwitch(selectedSession); } : undefined,
     newSession: () => void startNewSession(),
     clearFlowHistory: () => void runFlow("clear"),
