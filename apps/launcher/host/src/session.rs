@@ -4116,6 +4116,45 @@ impl Session {
         })
     }
 
+    /// A new conversation takes a warm runtime for its folder as soon as it is
+    /// created, when one is ready: the switch to its file and the model choice
+    /// happen while the user types, so the first send only hands over the prompt
+    /// (#117). With no ready runtime for the folder it stays pending and starts on
+    /// the first send, as before: creating a session never starts a runtime.
+    pub fn attach_early(self: &Arc<Self>) {
+        if !matches!(self.status(), Status::Pending) || !self.fresh.load(Ordering::SeqCst) {
+            return;
+        }
+        let ready = self
+            .config
+            .warm
+            .get()
+            .is_some_and(|pool| pool.ready_for(Path::new(&self.runtime_cwd())));
+        if !ready {
+            return;
+        }
+        log(&self.home, "info", "session.attach_early", json!({ "session": self.id }));
+        self.set_status(Status::Starting);
+        self.start(true);
+    }
+
+    /// Nothing was ever said in it: a new conversation the user left before
+    /// sending. It keeps no runtime once no client shows it.
+    fn untouched(&self) -> bool {
+        self.fresh.load(Ordering::SeqCst)
+            && self.active_turn().is_none()
+            && self
+                .history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+            && self
+                .queued_turns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+    }
+
     fn start(self: &Arc<Self>, from_pending: bool) {
         if let Err(error) = std::fs::OpenOptions::new()
             .create(true)
@@ -5272,10 +5311,16 @@ impl SessionManager {
         let stale: Vec<String> = sessions
             .iter()
             .filter(|(id, session)| {
-                let idle = session.status() == Status::Idle
-                    && session.subscriber_count() == 0
+                // A new conversation attached early and left untouched gives its
+                // runtime back as soon as no client shows it.
+                let untouched = session.status() == Status::Idle
                     && !held.contains(id)
-                    && session.last_activity().elapsed() >= ttl;
+                    && session.untouched();
+                let idle = untouched
+                    || session.status() == Status::Idle
+                        && session.subscriber_count() == 0
+                        && !held.contains(id)
+                        && session.last_activity().elapsed() >= ttl;
                 let pending = session.status() == Status::Pending
                     && !held.contains(id)
                     && session.last_activity().elapsed() >= ttl;

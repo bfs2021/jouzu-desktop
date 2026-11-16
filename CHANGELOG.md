@@ -6,6 +6,13 @@
   different folder, so everything created before it was missing from the list. Desktop uses
   the folder it has always used again (`data` in the Desktop folder, or `JOUZU_HOME` when
   set), does not move it between releases and never copies data into or out of it (#112).
+- The first message in a new session reaches the model sooner. When the folder has a warm
+  runtime ready, a new session attaches to it as soon as it is created, so sending only hands
+  over the message instead of first switching the runtime to the session (#117). A new
+  session left without a message gives its runtime back as soon as no window shows it.
+- Playbook timings are judged by what the app controls: own message and the turn visibly
+  working by the median of five new sessions, and the host's part of a reply from host.log.
+  The answer's own time (provider and model) is recorded, not gated (#97).
 
 ## 1.1.3-rc.1 - 2026-11-15
 

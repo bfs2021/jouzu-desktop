@@ -40,16 +40,54 @@ const labels = {
   coldFirstReadable: ["Cold first readable", null],
   newSessionUsable: ["New session usable", 2000],
   modelMenuVisible: ["Model menu visible", 1000],
-  ownMessageVisible: ["Own message visible", 100],
+  ownMessageVisible: ["Own message visible (median of new sessions)", 100],
+  ownMessageVisibleSlowest: ["Own message visible, slowest", null],
+  workingVisible: ["Turn visibly working (median)", 100],
+  workingVisibleSlowest: ["Turn visibly working, slowest", null],
+  warmFirstReadableSlowest: ["Answer readable, slowest (provider + model)", null],
+  turnObservedEndSlowest: ["Turn observed end, slowest", null],
   ownMessage: ["Own message visible", 100],
   warmOwnMessage: ["Warm own message visible", 100],
-  warmFirstReadable: ["Warm first readable", 1000],
+  // Waits for the provider and the model's reasoning; recorded, not gated (#97).
+  warmFirstReadable: ["Answer readable (median; provider + model)", null],
   turnObservedEnd: ["Turn observed end", null],
   stopToIdle: ["Stop to idle", 2000],
   secondNewSessionUsable: ["Second session usable", 2000],
   savedSessionSwitch: ["Saved-session switch", 2000],
   newRowCount: ["New session rows visible", null],
 };
+/**
+ * Host part of a reply, from host.log (PLAYBOOK_HOST_LOG): from `message.accepted`
+ * to the runtime asking the model (`step.start`, step 1) for each turn the run
+ * sent. This is the app's own work before the provider is involved; the playbook
+ * itself stays black-box, the report reads the log afterwards.
+ * Limit 200 ms (median of first turns in new sessions; slowest <= 400 ms): a later
+ * turn in the same session does the same work in about 40 ms on Windows, so a first
+ * turn has no reason to be slower once the runtime is attached before the send.
+ */
+async function hostTiming(run) {
+  const path = process.env.PLAYBOOK_HOST_LOG;
+  if (!path) return null;
+  const from = Date.parse(run.startedAt ?? 0), to = Date.parse(run.finishedAt ?? new Date().toISOString());
+  const turns = new Map();
+  const seenSessions = new Set();
+  for (const line of (await readFile(path, "utf8")).split(/\r?\n/)) {
+    let entry; try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.event !== "timing") continue;
+    const at = Date.parse(entry.ts), f = entry.fields ?? {};
+    if (!(at >= from && at <= to) || !f.clientMessageId) continue;
+    if (f.mark === "turn.start" && !turns.has(f.clientMessageId)) {
+      turns.set(f.clientMessageId, { session: f.session, accepted: at, first: !seenSessions.has(f.session) });
+      seenSessions.add(f.session);
+    }
+    const turn = turns.get(f.clientMessageId);
+    if (f.mark === "step.start" && turn && turn.modelAsked == null) turn.modelAsked = at - turn.accepted;
+  }
+  const pick = first => [...turns.values()].filter(t => t.first === first && t.modelAsked != null).map(t => t.modelAsked).sort((a, b) => a - b);
+  const stat = list => list.length ? { median: list[Math.floor((list.length - 1) / 2)], slowest: list[list.length - 1], samples: list } : null;
+  return { first: stat(pick(true)), later: stat(pick(false)) };
+}
+
 const fmt = value => value == null ? "not measured" : `${Math.round(value)} ms`;
 const slug = value => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
@@ -61,6 +99,13 @@ const allMetrics = Object.entries(run.metrics ?? {}).map(([id, value]) => {
   const status = gate ? (gate.ok ? "pass" : "fail") : limit == null ? "record" : value <= limit ? "pass" : "fail";
   return { id, label, valueMs: value, limitMs: limit, status };
 });
+const host = await hostTiming(run);
+if (host?.first) {
+  const limit = 200;
+  const ok = host.first.median <= limit && host.first.slowest <= limit * 2;
+  allMetrics.push({ id: "sendToModelRequest", label: "Send to model request, first turn (host.log, median)", valueMs: host.first.median, limitMs: limit, status: ok ? "pass" : "fail", slowestMs: host.first.slowest, samples: host.first.samples });
+}
+if (host?.later) allMetrics.push({ id: "sendToModelRequestLater", label: "Send to model request, later turns (host.log, median)", valueMs: host.later.median, limitMs: null, status: "record" });
 const gates = allMetrics.filter(metric => metric.limitMs != null);
 const observations = allMetrics.filter(metric => metric.limitMs == null).map(({ id, label, valueMs }) => ({ id, label, valueMs }));
 const failed = gates.filter(gate => gate.status === "fail").map(gate => gate.id);
@@ -74,9 +119,10 @@ const scenarios = (run.scenarios ?? []).map(item => {
   };
 });
 const ranStop = scenarios.some(item => /stop/i.test(`${item.id} ${item.name}`));
-const missing = missingBase.filter(id => {
+const missing = [...missingBase, ...(host?.first ? [] : ["hostTiming"])].filter(id => {
   if (id === "coldProcessLaunch") return run.metrics?.coldStartToInteractive == null;
   if (id === "stop") return !ranStop;
+  if (id === "hostTiming") return true;
   return true;
 });
 const coverage = { complete: missing.length === 0, missing };
@@ -145,7 +191,7 @@ const body = `<main>
 <h1>${title}</h1>
 <div class="sub">Build ${report.build.version} · ${report.build.kind} · commit <code>${report.build.commit}</code><br>
 Run ${report.runId} · generated ${report.generatedAt}<br>
-Black-box evidence only: accessible actions, visible text, unique reply sentinel. No host logs or source paths.</div>
+Black-box evidence: accessible actions, visible text, unique reply sentinel. The one host figure (send to model request) is read from host.log after the run. Repeated timings are judged by median, with the slowest sample allowed up to twice the limit.</div>
 <div class="summary">
   <div class="card"><div class="k">Release decision</div><div class="v ${releaseReleasable ? "good" : "bad"}">${releaseReleasable ? "PASS" : report.verdict.status.toUpperCase()}</div>
   <div class="muted">${releaseReleasable ? "All recorded gates and required coverage passed." : `Not releasable. Blocking gates: ${failed.length ? failed.join(", ") : "none recorded"}; missing coverage: ${missing.length}.`}</div></div>

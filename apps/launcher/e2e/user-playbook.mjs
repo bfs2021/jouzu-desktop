@@ -16,6 +16,28 @@ const now = () => Date.now();
 const assertGate = (name, value, limit) => {
   result.gates[name] = { value, limit, ok: value <= limit };
 };
+/**
+ * A timing measured several times is judged by its median and its slowest sample,
+ * never by one sample: one slow sample is noise, a slow median is the product.
+ * Limits (why each number):
+ * - 100 ms: the user sees their own action answered at once (own message, the turn
+ *   visibly working). Nothing has to leave the machine for it.
+ * - slowest <= 2x the limit: an occasional hiccup is tolerated, a pattern is not.
+ */
+const assertRepeatedGate = (name, samples, limit) => {
+  const sorted = [...samples].sort((a, b) => a - b);
+  const median = sorted[Math.floor((sorted.length - 1) / 2)];
+  const slowest = sorted[sorted.length - 1];
+  result.metrics[name] = median;
+  result.metrics[`${name}Slowest`] = slowest;
+  result.gates[name] = { value: median, slowest, samples: sorted, limit, slowestLimit: limit * 2, ok: median <= limit && slowest <= limit * 2 };
+};
+const record = (name, samples) => {
+  const sorted = [...samples].sort((a, b) => a - b);
+  result.metrics[name] = sorted[Math.floor((sorted.length - 1) / 2)];
+  result.metrics[`${name}Slowest`] = sorted[sorted.length - 1];
+  result.samples = { ...(result.samples ?? {}), [name]: sorted };
+};
 
 page.on("pageerror", error => result.errors.push(String(error)));
 page.on("console", message => {
@@ -283,26 +305,44 @@ try {
   await page.getByText(modelName).first().waitFor({ timeout: 5_000 });
   scenario("P0-4 model selection", true);
 
+  // The first turn of a new session, PLAYBOOK_REPEAT times (default 5), each in a
+  // session of its own on the selected model.
+  // Gated (the app's own work): own message visible, the turn visibly working (Stop).
+  // Recorded only: the answer itself. It waits for the provider and the model's
+  // reasoning (0.5-7 s measured for one prompt, #97), which no app change can bound;
+  // the host's part of it is gated from host.log in the report (send to model request).
   const prompt = "What is 17 × 23? Reply with only the number.";
   const reply = "391";
-  start = now();
-  await composer().fill(prompt);
-  await send().click();
-  await waitForConversationText(prompt, 5_000);
-  const ownMessage = now() - start;
-  await mark("ownMessageVisible", ownMessage);
-  assertGate("ownMessageVisible", ownMessage, 100);
-
-  await waitForConversationText(reply);
-  const firstReadable = now() - start;
-  await mark("warmFirstReadable", firstReadable);
-  assertGate("warmFirstReadable", firstReadable, 1_000);
-
-  // Turn end = Stop gone and Send enabled; no hint string is used.
-  await stop().waitFor({ state: "detached", timeout: 30_000 }).catch(() => {});
-  await page.getByRole("button", { name: /^send$/i }).waitFor({ timeout: 30_000 });
-  await mark("turnObservedEnd", now() - start);
-  scenario("P0-1 fresh turn", (await page.locator("body").innerText()).includes(reply));
+  const repeat = Math.max(1, Number(process.env.PLAYBOOK_REPEAT ?? 5));
+  const own = [], working = [], readable = [], ended = [];
+  let freshOk = true;
+  for (let i = 0; i < repeat; i++) {
+    if (i > 0) {
+      await newSession().click();
+      await composer().waitFor({ timeout: 10_000 });
+    }
+    start = now();
+    await composer().fill(prompt);
+    await send().click();
+    const ownSeen = waitForConversationText(prompt, 5_000).then(() => now() - start);
+    const stopSeen = stop().waitFor({ timeout: 5_000 }).then(() => now() - start, () => null);
+    own.push(await ownSeen);
+    const stopMs = await stopSeen;
+    await waitForConversationText(reply, 60_000);
+    readable.push(now() - start);
+    // Turn end = Stop gone and Send enabled; no hint string is used.
+    await stop().waitFor({ state: "detached", timeout: 30_000 }).catch(() => {});
+    await page.getByRole("button", { name: /^send$/i }).waitFor({ timeout: 30_000 });
+    ended.push(now() - start);
+    // A reply faster than Stop could be seen shows the turn as done instead.
+    working.push(stopMs ?? readable[readable.length - 1]);
+    freshOk &&= (await conversation().innerText()).includes(reply);
+  }
+  assertRepeatedGate("ownMessageVisible", own, 100);
+  assertRepeatedGate("workingVisible", working, 100);
+  record("warmFirstReadable", readable);
+  record("turnObservedEnd", ended);
+  scenario("P0-1 fresh turn", freshOk, `${repeat} new sessions`);
   await page.screenshot({ path: process.env.TEMP + "\\playbook-01-chat.png" });
 
   // P0-2: second new session must not show the previous transcript.

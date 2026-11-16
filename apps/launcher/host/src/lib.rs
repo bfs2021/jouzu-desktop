@@ -640,6 +640,8 @@ async fn create_session(
     {
         state.sessions.hold(client_id, &session.id);
     }
+    // After the default model is chosen, so the attach applies it.
+    session.attach_early();
     // The session as it stands (model, queue, turn, prompts): the client starts
     // from this and follows events after `cursor`, so nothing published before
     // it subscribed (the model chosen at creation) is missed.
@@ -4284,6 +4286,74 @@ mod session_tests {
         assert_eq!(next["state"], "ready", "{next}");
         assert_ne!(next["pid"].as_u64().unwrap() as u32, warm_pid);
         assert_eq!(next["taken"], 1);
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_new_session_attaches_a_ready_warm_runtime_before_the_first_send() {
+        let (manager, _home, workspace) = manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let folder = workspace.path().to_str().unwrap();
+        // The first new session aims the pool at its folder.
+        let first = manager.create_pending(folder, None, None).unwrap();
+        let aimed = pool.wait_settled(Duration::from_secs(10)).await;
+        assert_eq!(aimed["state"], "ready", "{aimed}");
+        let warm_pid = aimed["pid"].as_u64().unwrap() as u32;
+        // What create_session does: the default model, then the early attach.
+        let session = manager.create_pending(folder, None, None).unwrap();
+        session.adopt_default_model(Some(json!({ "provider": "fixture", "id": "default-x" })));
+        session.attach_early();
+        assert_eq!(session.runtime_pid(), Some(warm_pid));
+        // Attached and the model applied with nothing sent.
+        wait_status(&session, Status::Idle).await;
+        let state = session
+            .request(json!({ "type": "get_state" }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(state["model"]["id"], "default-x", "{state}");
+        session.send("m1", "hello").unwrap();
+        wait_status(&session, Status::Idle).await;
+        assert_eq!(session.runtime_pid(), Some(warm_pid));
+        drop(first);
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_new_session_without_a_ready_runtime_waits_for_its_first_send() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        session.attach_early();
+        assert_eq!(session.status(), Status::Pending);
+        assert_eq!(session.runtime_pid(), None);
+    }
+
+    #[tokio::test]
+    async fn an_untouched_new_session_nobody_shows_gives_its_runtime_back() {
+        let (manager, _home, workspace) = manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let folder = workspace.path().to_str().unwrap();
+        let _aim = manager.create_pending(folder, None, None).unwrap();
+        pool.wait_settled(Duration::from_secs(10)).await;
+        let left = manager.create_pending(folder, None, None).unwrap();
+        left.attach_early();
+        wait_status(&left, Status::Idle).await;
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &left.id);
+        // Shown by a client: kept.
+        manager.reap_idle(Duration::from_secs(3600));
+        assert!(manager.get(&left.id).is_some());
+        // Used: kept until the usual idle time.
+        let used = manager.create_pending(folder, None, None).unwrap();
+        used.send("u1", "hello").unwrap();
+        wait_status(&used, Status::Idle).await;
+        // The client moves on: the untouched one is released at once, the used one is not.
+        manager.hold("window", &used.id);
+        manager.reap_idle(Duration::from_secs(3600));
+        assert!(manager.get(&left.id).is_none());
+        assert_eq!(left.status(), Status::Stopped);
+        assert!(manager.get(&used.id).is_some());
         manager.stop_all();
     }
 
