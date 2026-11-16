@@ -155,7 +155,9 @@ async fn main() -> ExitCode {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                sessions.reap_idle(std::time::Duration::from_secs(15 * 60));
+                sessions.reap_idle(jouzu_host::session::IdleLimits::all(
+                    std::time::Duration::from_secs(15 * 60),
+                ));
             }
         });
     }

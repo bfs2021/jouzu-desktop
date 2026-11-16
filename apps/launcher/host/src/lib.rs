@@ -13,6 +13,7 @@ use std::{
 };
 
 mod artifacts;
+pub mod awake;
 pub mod control;
 mod environment;
 pub mod events;
@@ -2841,7 +2842,7 @@ mod tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
-    use crate::session::{Attachment, RuntimeSpec, SessionManager, Status};
+    use crate::session::{Attachment, IdleLimits, RuntimeSpec, SessionManager, Status};
     use axum::http::{Method, Request};
     use http_body_util::BodyExt;
     use std::{
@@ -4420,7 +4421,7 @@ mod session_tests {
         let _stream = manager.connect_client("window");
         manager.hold("window", &left.id);
         // Shown by a client: kept.
-        manager.reap_idle(Duration::from_secs(3600));
+        manager.reap_idle(IdleLimits::all(Duration::from_secs(3600)));
         assert!(manager.get(&left.id).is_some());
         // Used: kept until the usual idle time.
         let used = manager.create_pending(folder, None, None).unwrap();
@@ -4428,7 +4429,7 @@ mod session_tests {
         wait_status(&used, Status::Idle).await;
         // The client moves on: the untouched one is released at once, the used one is not.
         manager.hold("window", &used.id);
-        manager.reap_idle(Duration::from_secs(3600));
+        manager.reap_idle(IdleLimits::all(Duration::from_secs(3600)));
         assert!(manager.get(&left.id).is_none());
         assert_eq!(left.status(), Status::Stopped);
         assert!(manager.get(&used.id).is_some());
@@ -5698,7 +5699,7 @@ mod session_tests {
         let stream = manager.connect_client("desktop");
         manager.hold("desktop", &first.id);
         manager.hold("desktop", &second.id);
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(
             manager.get(&first.id).is_none(),
             "a session the client left is reaped"
@@ -5710,15 +5711,82 @@ mod session_tests {
 
         drop(stream);
         let reconnected = manager.connect_client("desktop");
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(
             manager.get(&second.id).is_some(),
             "a reconnected stream keeps its hold"
         );
 
         drop(reconnected);
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(manager.get(&second.id).is_none(), "a closed stream holds nothing");
+    }
+
+    #[tokio::test]
+    async fn the_session_a_client_shows_survives_its_stream_dropping_for_the_idle_timeout() {
+        // Issue #111: a sleeping machine drops the window's event stream. At resume
+        // the reaper runs before the stream reconnects; the session in view must
+        // still be there when it does.
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().to_str().unwrap();
+        let shown = manager.create(path, None, Some("shown".into())).unwrap();
+        let left = manager.create(path, None, Some("left".into())).unwrap();
+        wait_status(&shown, Status::Idle).await;
+        wait_status(&left, Status::Idle).await;
+        let stream = manager.connect_client("desktop");
+        manager.hold("desktop", &shown.id);
+        drop(stream);
+
+        let limits = IdleLimits {
+            idle: Duration::ZERO,
+            pending: Duration::ZERO,
+            released_hold: Duration::from_secs(3600),
+        };
+        manager.reap_idle(limits);
+        assert!(manager.get(&shown.id).is_some(), "the shown session is kept while its client reconnects");
+        assert!(manager.get(&left.id).is_none(), "other idle sessions are still reaped");
+
+        // The reconnected client keeps it as before.
+        let _reconnected = manager.connect_client("desktop");
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
+        assert!(manager.get(&shown.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_comes_back_releases_its_session_after_the_hold() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let stream = manager.connect_client("desktop");
+        manager.hold("desktop", &session.id);
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        manager.reap_idle(IdleLimits {
+            idle: Duration::ZERO,
+            pending: Duration::ZERO,
+            released_hold: Duration::from_millis(50),
+        });
+        assert!(manager.get(&session.id).is_none());
+        assert_eq!(session.status(), Status::Stopped);
+    }
+
+    #[tokio::test]
+    async fn an_untouched_new_session_in_view_survives_a_dropped_stream() {
+        let (manager, _home, workspace) = manager(50);
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), None, None)
+            .unwrap();
+        let stream = manager.connect_client("desktop");
+        manager.hold("desktop", &session.id);
+        drop(stream);
+        manager.reap_idle(IdleLimits {
+            idle: Duration::ZERO,
+            pending: Duration::ZERO,
+            released_hold: Duration::from_secs(3600),
+        });
+        assert!(manager.get(&session.id).is_some());
     }
 
     #[tokio::test]
@@ -5729,7 +5797,7 @@ mod session_tests {
             .unwrap();
         let _stream = manager.connect_client("desktop");
         manager.hold("desktop", &session.id);
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(manager.get(&session.id).is_some());
     }
 
@@ -5741,7 +5809,7 @@ mod session_tests {
             .unwrap();
         wait_status(&session, Status::Idle).await;
         manager.hold("desktop", &session.id);
-        manager.reap_idle(Duration::ZERO);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
         assert!(manager.get(&session.id).is_none());
     }
 
