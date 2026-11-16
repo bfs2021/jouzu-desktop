@@ -570,6 +570,18 @@ impl WarmPool {
         self.fill();
     }
 
+    /// A runtime for `workspace` has answered and waits unused: taking it costs
+    /// only the switch to a session file, never a start.
+    pub fn ready_for(&self, workspace: &Path) -> bool {
+        self.lock().slots.iter().any(|slot| {
+            slot.ready_ms.is_some()
+                && slot
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|warm| same_folder(warm, workspace))
+        })
+    }
+
     /// The folder the pool warms most for: the most recent one.
     pub fn target(&self) -> Option<PathBuf> {
         self.lock().recent.first().cloned()
