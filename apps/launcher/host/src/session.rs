@@ -5472,8 +5472,11 @@ impl SessionManager {
                 let untouched = session.status() == Status::Idle
                     && !held.contains(id)
                     && session.untouched();
+                // A session in error that nobody shows can still own a live
+                // runtime; it is released like an idle one (#93). Opening it
+                // again starts it afresh.
                 let idle = untouched
-                    || session.status() == Status::Idle
+                    || matches!(session.status(), Status::Idle | Status::Error)
                         && session.subscriber_count() == 0
                         && !held.contains(id)
                         && session.last_activity().elapsed() >= limits.idle;

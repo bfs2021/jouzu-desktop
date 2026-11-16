@@ -4363,6 +4363,36 @@ mod session_tests {
         manager.stop_all();
     }
 
+    /// #93: visiting many sessions does not keep a runtime for each. Once the
+    /// window moves on and the idle limit passes, only the session it shows
+    /// keeps one (besides the warm pool).
+    #[tokio::test]
+    async fn sessions_the_window_left_give_their_runtimes_back() {
+        let (manager, _home, workspace) = manager(50);
+        let folder = workspace.path().to_str().unwrap();
+        let _stream = manager.connect_client("window");
+        let mut visited = Vec::new();
+        for n in 0..5 {
+            let path = workspace.path().join(format!("s{n}.jsonl"));
+            let session = manager.create(folder, Some(path.to_string_lossy().into_owned()), None).unwrap();
+            manager.hold("window", &session.id);
+            wait_status(&session, Status::Idle).await;
+            session.send(&format!("m{n}"), "hello").unwrap();
+            wait_status(&session, Status::Idle).await;
+            visited.push(session);
+        }
+        let limits = IdleLimits { idle: Duration::ZERO, pending: Duration::from_secs(3600), released_hold: Duration::from_secs(3600) };
+        manager.reap_idle(limits);
+        let live: Vec<_> = visited.iter().filter(|session| session.runtime_pid().is_some() && session.status() == Status::Idle).collect();
+        assert_eq!(live.len(), 1, "only the shown session keeps its runtime");
+        assert_eq!(live[0].id, visited[4].id);
+        for session in &visited[..4] {
+            assert_eq!(session.status(), Status::Stopped);
+            assert!(manager.get(&session.id).is_none());
+        }
+        manager.stop_all();
+    }
+
     /// #92: a new session left before anything was sent, with no runtime
     /// (nothing was warm), leaves no file once it is reaped or the host exits.
     #[tokio::test]
