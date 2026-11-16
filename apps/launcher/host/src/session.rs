@@ -105,6 +105,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+use crate::awake::AwakeInstant;
 use crate::log;
 use crate::runtime::adapter::pi::{self, DeltaKind, Record as PiRecord};
 use crate::runtime::{same_place, RequestError, RuntimeEvent, RuntimeSupervisor, SpawnSpec, WarmPool};
@@ -615,7 +616,8 @@ pub struct Session {
     thinking_level: Mutex<Option<String>>,
     subscribers: AtomicU64,
     next_client: AtomicU64,
-    last_activity: Mutex<Instant>,
+    /// Awake time, so a machine that slept does not count as idle (issue #111).
+    last_activity: Mutex<AwakeInstant>,
 }
 
 impl Session {
@@ -658,14 +660,14 @@ impl Session {
         *self
             .last_activity
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = AwakeInstant::now();
     }
 
     pub fn subscriber_count(&self) -> u64 {
         self.subscribers.load(Ordering::Relaxed)
     }
 
-    pub fn last_activity(&self) -> Instant {
+    pub fn last_activity(&self) -> AwakeInstant {
         *self
             .last_activity
             .lock()
@@ -4160,7 +4162,7 @@ impl Session {
             thinking_level: Mutex::new(None),
             subscribers: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
-            last_activity: Mutex::new(Instant::now()),
+            last_activity: Mutex::new(AwakeInstant::now()),
         })
     }
 
@@ -4746,7 +4748,8 @@ pub struct SessionManager {
     clients: Mutex<HashMap<String, Vec<String>>>,
     /// What each client connected to the global event stream has open. A
     /// client opens one session at a time; that session is never reaped while
-    /// the client's stream is connected. Other idle sessions are, so a window
+    /// the client's stream is connected, nor for the idle timeout after it
+    /// closes (a sleeping machine drops it). Other idle sessions are, so a window
     /// left open does not keep a runtime alive for every session it visited.
     holders: Mutex<HashMap<String, Holder>>,
     persisted_cache: Mutex<Option<Vec<Value>>>,
@@ -4759,10 +4762,47 @@ struct ManagedRuntime {
     events: Option<Arc<crate::events::EventHub>>,
 }
 
+/// How long, in awake time, the idle reaper waits before it stops a session.
+#[derive(Clone, Copy, Debug)]
+pub struct IdleLimits {
+    /// An idle session nobody shows or follows.
+    pub idle: Duration,
+    /// A session created but never started.
+    pub pending: Duration,
+    /// How long a client whose event stream closed still holds the session it shows.
+    pub released_hold: Duration,
+}
+
+impl IdleLimits {
+    /// The same limit for everything.
+    pub fn all(ttl: Duration) -> Self {
+        Self { idle: ttl, pending: ttl, released_hold: ttl }
+    }
+}
+
 #[derive(Default)]
 struct Holder {
     streams: usize,
     session: Option<String>,
+    /// When the client's last stream closed (awake time). A stream drops when the
+    /// machine sleeps or the window reloads; the client keeps its hold for the
+    /// idle timeout after that, so it finds the session it shows still running
+    /// when it reconnects (issue #111).
+    released: Option<AwakeInstant>,
+}
+
+impl Holder {
+    /// The session this client still holds: its stream is connected, or closed
+    /// less than `ttl` of awake time ago.
+    fn holds(&self, ttl: Duration) -> Option<&String> {
+        let connected = self.streams > 0;
+        let recent = self.released.is_some_and(|at| at.elapsed() < ttl);
+        if connected || recent {
+            self.session.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 /// One connected global stream. Dropping it releases the client's hold once
@@ -4780,9 +4820,12 @@ impl Drop for ClientStream {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Keep what the client had open: a stream that reconnects picks its
-        // hold up again. With no stream connected it protects nothing.
+        // hold up again. With no stream connected the hold lasts one idle timeout.
         if let Some(holder) = holders.get_mut(&self.client_id) {
             holder.streams = holder.streams.saturating_sub(1);
+            if holder.streams == 0 {
+                holder.released = Some(AwakeInstant::now());
+            }
         }
     }
 }
@@ -5409,14 +5452,13 @@ impl SessionManager {
     /// Session files live in the runtime home owned by the host. This index is
     /// metadata-only: it never starts a runtime and never returns transcript
     /// bodies.
-    pub fn reap_idle(&self, ttl: Duration) {
+    pub fn reap_idle(&self, limits: IdleLimits) {
         let held: Vec<String> = self
             .holders
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
-            .filter(|holder| holder.streams > 0)
-            .filter_map(|holder| holder.session.clone())
+            .filter_map(|holder| holder.holds(limits.released_hold).cloned())
             .collect();
         let mut sessions = self
             .sessions
@@ -5434,10 +5476,10 @@ impl SessionManager {
                     || session.status() == Status::Idle
                         && session.subscriber_count() == 0
                         && !held.contains(id)
-                        && session.last_activity().elapsed() >= ttl;
+                        && session.last_activity().elapsed() >= limits.idle;
                 let pending = session.status() == Status::Pending
                     && !held.contains(id)
-                    && session.last_activity().elapsed() >= ttl;
+                    && session.last_activity().elapsed() >= limits.pending;
                 idle || pending
             })
             .map(|(id, _)| id.clone())
@@ -5639,6 +5681,7 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(client_id.to_string())
+            .and_modify(|holder| holder.released = None)
             .or_default()
             .streams += 1;
         ClientStream {

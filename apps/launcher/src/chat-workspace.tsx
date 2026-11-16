@@ -642,6 +642,10 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     while (Date.now() < end && !sendCancelRef.current) {
       const current = connection.current;
       if (current?.snapshot.connected) return current;
+      if (current && current.snapshot.status === "stopped" && !switchingRef.current) {
+        if (!await reopenBoundSession()) return null;
+        continue;
+      }
       if (current?.snapshot.error && !current.snapshot.connected && !switchingRef.current) return null;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
@@ -957,6 +961,58 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       }
     }
   }
+  /**
+   * The host stopped the session this window is bound to (issue #111: the idle
+   * reaper after the machine slept). Open the same conversation again: a saved
+   * one is re-created from its file (the host replaces a stopped session at the
+   * same path), a blank one gets a new session. Selection and preview are left as
+   * the user set them; this only replaces the dead connection under them.
+   */
+  async function reopenBoundSession(): Promise<boolean> {
+    const stale = connection.current;
+    if (!stale || stale.snapshot.connected || switchingRef.current) return false;
+    const sessionFile = stale.snapshot.sessionFile;
+    const saved = !!sessionFile && stale.snapshot.projection.messages.length > 0;
+    switchingRef.current = true;
+    switchingTarget.current = saved ? sessionFile : "new";
+    setSwitching(true);
+    const promise = (async () => {
+      try {
+        // `enter` drops the stale pooled store for this path and opens a fresh one.
+        const next = saved ? await chatPool.enter(path, sessionFile) : await chatPool.lease(path);
+        if (connection.current !== stale) { if (!saved) void next.close().catch(() => {}); return false; }
+        bindClient(next);
+        // Dispose, not close: the host may give the reopened session the same id,
+        // and closing would stop it.
+        stale.dispose();
+        setSessionError(null);
+        void refreshSessions();
+        return true;
+      } catch (error) {
+        if (connection.current === stale) report(error, "Could not reopen this session.");
+        return false;
+      } finally {
+        switchingRef.current = false;
+        switchingTarget.current = null;
+        setSwitching(false);
+      }
+    })();
+    switchPromise.current = promise.then(() => undefined);
+    const current = switchPromise.current;
+    try { return await promise; }
+    finally { if (switchPromise.current === current) switchPromise.current = null; }
+  }
+  // Reopen automatically once per stopped connection. A failure is reported and
+  // left to the user's next send, so a runtime that cannot start is not retried
+  // in a loop.
+  const reopenTried = useRef<ChatConnection | null>(null);
+  useEffect(() => {
+    const stale = connection.current;
+    if (!stale || snapshot.connected || snapshot.status !== "stopped" || switching) return;
+    if (reopenTried.current === stale) return;
+    reopenTried.current = stale;
+    void reopenBoundSession();
+  }, [snapshot.connected, snapshot.status, switching]);
   function loadPreview(sessionPath: string) {
     const request = ++previewRequest.current;
     const cached = projectionCache.current.get(normalizedPath(sessionPath));
