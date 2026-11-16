@@ -49,6 +49,19 @@ describe("sessionAlerts", () => {
     expect(alert.dismiss).toBeTypeOf("function");
   });
 
+  it("offers a restart, not a dismiss, once the host gave up on the session (#95)", () => {
+    const on = { ...handlers(), restartSession: vi.fn() };
+    const [alert] = sessionAlerts({ runtimeError: "This session could not be opened: Flow session metadata is missing or inconsistent.", sessionFailed: true }, on);
+    expect(alert.text).toBe("This session stopped and needs a restart.");
+    expect(alert.details).toContain("Flow session metadata");
+    expect(alert.dismiss).toBeUndefined();
+    expect(alert.actions.map(action => action.label)).toEqual(["Restart session"]);
+    alert.actions[0].run();
+    expect(on.restartSession).toHaveBeenCalledOnce();
+    // The reason can be gone (a reconnect forgets it); the way back stays.
+    expect(sessionAlerts({ sessionFailed: true }, on).map(item => item.actions[0]?.label)).toEqual(["Restart session"]);
+  });
+
   it("reports one blocking failure once, whichever source reported it", () => {
     const raw = "Submission retention limit reached; admission is held.";
     const alerts = sessionAlerts({ openError: raw, runtimeError: raw, replyError: raw }, handlers());

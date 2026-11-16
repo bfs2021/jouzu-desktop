@@ -1321,6 +1321,7 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
     offline: !chatUnavailable && !snapshot.connected && workspaceError ? workspaceError : null,
     openError: sessionError,
     runtimeError: snapshot.connected ? workspaceError : null,
+    sessionFailed: showingAttached && snapshot.status === "error",
     historyError: showingAttached ? snapshot.historyError : null,
     imageRefused: imageRepair,
     replyError,
