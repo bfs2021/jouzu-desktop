@@ -4445,10 +4445,125 @@ mod session_tests {
         wait_status(&used, Status::Idle).await;
         // The client moves on: the untouched one is released at once, the used one is not.
         manager.hold("window", &used.id);
+        let left_file = left.session_path.lock().unwrap().clone().expect("a new session has a file");
+        let used_file = used.session_path.lock().unwrap().clone().expect("a new session has a file");
         manager.reap_idle(IdleLimits::all(Duration::from_secs(3600)));
         assert!(manager.get(&left.id).is_none());
         assert_eq!(left.status(), Status::Stopped);
         assert!(manager.get(&used.id).is_some());
+        // #92: the never-used one leaves no file; the used one keeps its own.
+        wait_until(|| !std::path::Path::new(&left_file).exists()).await;
+        assert!(std::path::Path::new(&used_file).exists());
+        manager.stop_all();
+    }
+
+    /// #93: visiting many sessions does not keep a runtime for each. Once the
+    /// window moves on and the idle limit passes, only the session it shows
+    /// keeps one (besides the warm pool).
+    #[tokio::test]
+    async fn sessions_the_window_left_give_their_runtimes_back() {
+        let (manager, _home, workspace) = manager(50);
+        let folder = workspace.path().to_str().unwrap();
+        let _stream = manager.connect_client("window");
+        let mut visited = Vec::new();
+        for n in 0..5 {
+            let path = workspace.path().join(format!("s{n}.jsonl"));
+            let session = manager.create(folder, Some(path.to_string_lossy().into_owned()), None).unwrap();
+            manager.hold("window", &session.id);
+            wait_status(&session, Status::Idle).await;
+            session.send(&format!("m{n}"), "hello").unwrap();
+            wait_status(&session, Status::Idle).await;
+            visited.push(session);
+        }
+        let limits = IdleLimits { idle: Duration::ZERO, pending: Duration::from_secs(3600), released_hold: Duration::from_secs(3600) };
+        manager.reap_idle(limits);
+        let live: Vec<_> = visited.iter().filter(|session| session.runtime_pid().is_some() && session.status() == Status::Idle).collect();
+        assert_eq!(live.len(), 1, "only the shown session keeps its runtime");
+        assert_eq!(live[0].id, visited[4].id);
+        for session in &visited[..4] {
+            assert_eq!(session.status(), Status::Stopped);
+            assert!(manager.get(&session.id).is_none());
+        }
+        manager.stop_all();
+    }
+
+    /// #92: a new session left before anything was sent, with no runtime
+    /// (nothing was warm), leaves no file once it is reaped or the host exits.
+    #[tokio::test]
+    async fn a_new_session_never_used_leaves_no_file() {
+        let (manager, _home, workspace) = manager(50);
+        let folder = workspace.path().to_str().unwrap();
+        let left = manager.create_pending(folder, None, None).unwrap();
+        let left_file = left.session_path.lock().unwrap().clone().expect("a new session has a file");
+        let kept = manager.create_pending(folder, None, None).unwrap();
+        let kept_file = kept.session_path.lock().unwrap().clone().expect("a new session has a file");
+        assert!(std::path::Path::new(&left_file).exists());
+        let _stream = manager.connect_client("window");
+        manager.hold("window", &kept.id);
+        manager.reap_idle(IdleLimits::all(Duration::ZERO));
+        assert!(std::path::Path::new(&kept_file).exists(), "shown by a client: kept");
+        assert_eq!(left.status(), Status::Cancelled);
+        assert!(!std::path::Path::new(&left_file).exists());
+        // A file that holds a conversation is never removed, whatever the host thinks.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&kept_file)
+            .and_then(|mut file| {
+                std::io::Write::write_all(
+                    &mut file,
+                    b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+                )
+            })
+            .unwrap();
+        manager.shutdown();
+        assert!(std::path::Path::new(&kept_file).exists());
+    }
+
+    /// #93: a saved conversation stopped before its start ran (the start is
+    /// spawned) must not start a runtime that nobody owns.
+    #[tokio::test]
+    async fn a_session_stopped_before_its_start_runs_starts_no_runtime() {
+        let (manager, _home, workspace) = manager(50);
+        let path = workspace.path().join("old.jsonl");
+        let session = manager
+            .create(
+                workspace.path().to_str().unwrap(),
+                Some(path.to_string_lossy().into_owned()),
+                None,
+            )
+            .unwrap();
+        session.stop();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(session.status(), Status::Stopped);
+        assert_eq!(session.runtime_pid(), None);
+    }
+
+    /// #94: until one runtime has answered, a runtime may still have to apply
+    /// its profile under a lock it does not wait for. A session that finds
+    /// nothing to take while another runtime boots waits for it instead of
+    /// starting a second one beside it.
+    #[tokio::test]
+    async fn before_any_runtime_answered_runtimes_start_one_at_a_time() {
+        let (manager, _home, workspace) = slow_manager(50);
+        let pool = manager.enable_warm_runtime().expect("warm pool");
+        let folder = workspace.path().to_str().unwrap();
+        wait_until(|| pool.status()["warm"] == 1).await;
+        let first = manager
+            .create(folder, Some(workspace.path().join("a.jsonl").to_string_lossy().into_owned()), None)
+            .unwrap();
+        wait_until(|| first.runtime_pid().is_some()).await;
+        // The warm runtime, still booting, went to the first session.
+        let second = manager
+            .create(folder, Some(workspace.path().join("b.jsonl").to_string_lossy().into_owned()), None)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(second.runtime_pid(), None, "no second runtime while the first boots");
+        assert!(pool.must_wait(), "{}", pool.status());
+        wait_status(&first, Status::Idle).await;
+        // Once one answered, the second starts.
+        wait_status(&second, Status::Idle).await;
+        assert!(second.runtime_pid().is_some());
+        assert_ne!(second.runtime_pid(), first.runtime_pid());
         manager.stop_all();
     }
 
