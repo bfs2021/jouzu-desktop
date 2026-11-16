@@ -55,7 +55,7 @@ function hostGroups(client: HostClient) {
     attach: (workspacePath, sessionPath) => client.attach(workspacePath, sessionPath),
     view: sessionId => client.view(sessionId),
     history: (sessionId, page) => client.history(sessionId, page),
-    messages: (sessionPath, limit) => client.messages(sessionPath, limit),
+    messages: (sessionPath, page) => client.messages(sessionPath, page),
     sanitizeImages: sessionPath => client.sanitizeSessionImages(sessionPath),
     send: (sessionId, message) =>
       client.send(sessionId, message.text, message.clientMessageId, message.attachments ?? []),
@@ -72,7 +72,7 @@ function hostGroups(client: HostClient) {
       await client.stop(sessionId);
     },
     update: (sessionPath, change) => client.updateSession(sessionPath, change),
-    branch: (sessionPath, messageIndex) => client.branch(sessionPath, messageIndex),
+    branch: (sessionPath, turn) => client.branch(sessionPath, turn),
     recover: sessionPath => client.recover(sessionPath),
     timing: async sessionPath => (await client.timing(sessionPath)) as never,
     flowReports: async sessionPath => (await client.flowReports(sessionPath)) as never,

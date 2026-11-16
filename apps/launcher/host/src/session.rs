@@ -79,9 +79,11 @@ fn saved_model(path: &Path) -> Option<Value> {
 }
 
 /// The messages a saved session file holds, in the order they were written.
+/// Every message of a saved session file, oldest first. The whole file is read:
+/// a long session's newest messages are at its end (#20).
 fn saved_messages(path: &Path) -> std::io::Result<Vec<Value>> {
     let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(std::io::Read::take(file, 32 * 1024 * 1024));
+    let reader = std::io::BufReader::new(file);
     let mut messages = Vec::new();
     for line in std::io::BufRead::lines(reader) {
         let Ok(line) = line else { break };
@@ -725,12 +727,16 @@ impl Session {
         let mut page = page;
         // A resync while a step is streaming must include what it has already
         // said. This row is synthetic: the step's reply is appended to history
-        // when the runtime finishes writing it.
-        let active = self
-            .active_message
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        // when the runtime finishes writing it. It is the newest row, so only
+        // the newest page carries it, never an earlier one.
+        let active = if before.is_some() {
+            None
+        } else {
+            self.active_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        };
         if let Some(turn) = active {
             let text = self
                 .assistant_text
@@ -775,13 +781,24 @@ impl Session {
 
     fn push_history(&self, mut row: Value) {
         let cursor = self.history_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Which user turn of the conversation a row belongs to (1 = the first
+        // user message). The saved file counts user messages the same way, so a
+        // client that loaded only some pages can still name a turn to branch at.
+        let previous = history
+            .last()
+            .and_then(|row| row.get("turn"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let user = row.get("kind").and_then(Value::as_str) == Some("user");
         if let Some(object) = row.as_object_mut() {
             object.insert("cursor".to_string(), json!(cursor));
+            object.insert("turn".to_string(), json!(previous + u64::from(user)));
         }
-        self.history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(row);
+        history.push(row);
     }
 
     /// A queued message the runtime has used: its row joins history now, where
@@ -4878,7 +4895,13 @@ impl SessionManager {
         Ok(Some(canonical_path(&destination.to_string_lossy())))
     }
 
-    pub fn branch_session(&self, session_path: &str, message_index: usize) -> Result<String, ApiError> {
+    /// Copy a saved conversation through the end of its user turn `turn` (1 = the
+    /// first user message) into a new saved session. A turn ends where the next
+    /// user message starts, so its replies and tool results come along. Clients
+    /// name the turn from the `turn` of a history row, which counts user
+    /// messages the same way, so it is right whatever part of the history they
+    /// loaded.
+    pub fn branch_session(&self, session_path: &str, turn: usize) -> Result<String, ApiError> {
         let source = self.session_file(session_path)?;
         let text = std::fs::read_to_string(&source)
             .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
@@ -4893,23 +4916,27 @@ impl SessionManager {
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::bad_request("Session has no workspace"))?;
         let mut kept = Vec::new();
-        let mut seen = 0usize;
-        let mut found = false;
+        let mut users = 0usize;
         for line in lines {
             let Ok(entry) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            kept.push(line);
-            if entry.get("type").and_then(Value::as_str) == Some("message") {
-                if seen == message_index {
-                    found = true;
+            let user = entry.get("type").and_then(Value::as_str) == Some("message")
+                && entry
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("user");
+            if user {
+                if users == turn {
                     break;
                 }
-                seen += 1;
+                users += 1;
             }
+            kept.push(line);
         }
-        if !found {
-            return Err(ApiError::bad_request("Message not found in session"));
+        if turn == 0 || users < turn {
+            return Err(ApiError::bad_request("Turn not found in session"));
         }
         let directory = source
             .parent()
@@ -4942,20 +4969,33 @@ impl SessionManager {
         Ok(canonical_path(&target.to_string_lossy()))
     }
 
+    /// A page of a saved session's messages, read from its file: the `limit`
+    /// messages before position `before` (the newest when absent). `nextBefore`
+    /// reads the page before this one, null at the first message; `turn` is the
+    /// user turn the page starts in (user messages before it), so a client can
+    /// number turns without the earlier pages (#20).
     pub fn messages(
         &self,
         session_path: &str,
         limit: Option<usize>,
-    ) -> Result<Vec<Value>, ApiError> {
+        before: Option<usize>,
+    ) -> Result<Value, ApiError> {
         let path = self.session_file(session_path)?;
         let mut messages = saved_messages(&path)
             .map_err(|error| ApiError::internal(format!("Could not read the session: {error}")))?;
-        if let Some(limit) = limit {
-            if messages.len() > limit {
-                messages.drain(..messages.len() - limit);
-            }
-        }
-        Ok(messages)
+        let end = before.unwrap_or(messages.len()).min(messages.len());
+        let start = limit.map_or(0, |limit| end.saturating_sub(limit.max(1)));
+        let turn = messages[..start]
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .count();
+        messages.truncate(end);
+        let page = messages.split_off(start);
+        Ok(json!({
+            "messages": page,
+            "nextBefore": if start > 0 { json!(start) } else { Value::Null },
+            "turn": turn,
+        }))
     }
 
     pub fn timing(&self, session_path: &str) -> Result<Value, ApiError> {
