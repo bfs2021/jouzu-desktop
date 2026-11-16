@@ -3597,6 +3597,84 @@ mod session_tests {
         assert_eq!(session.status(), Status::Error);
     }
 
+    /// A saved conversation and a message sent to it before its runtime started.
+    async fn failing_session(env: &[(&str, &str)]) -> (Arc<crate::session::Session>, Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir, String) {
+        let (manager, home, workspace) = manager_with_env(50, env);
+        let header = json!({ "type": "session", "version": 3, "id": "fails", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let file = workspace.path().join("fails.jsonl");
+        std::fs::write(&file, format!("{header}\n")).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let session = manager
+            .create_pending(workspace.path().to_str().unwrap(), Some(path.clone()), None)
+            .unwrap();
+        session.send("waiting", "hello").unwrap();
+        (session, manager, home, workspace, path)
+    }
+
+    /// What a client is left with once the session has failed: no turn to
+    /// wait for, no runtime to stop, and the reason.
+    fn assert_failed_and_settled(session: &crate::session::Session, code: &str) {
+        let summary = session.summary();
+        assert_eq!(summary["status"], "error", "{summary}");
+        assert!(summary["activeTurn"].is_null(), "a failed session keeps no turn waiting: {summary}");
+        assert_eq!(session.runtime_pid(), None, "a failed session keeps no runtime");
+        let (events, _) = session.events_after(1);
+        let ended = events
+            .iter()
+            .find(|event| event.event == "turn.end")
+            .unwrap_or_else(|| panic!("the waiting turn ended: {:?}", events.iter().map(|event| &event.event).collect::<Vec<_>>()));
+        assert_eq!(ended.data["status"], "failed", "{}", ended.data);
+        assert_eq!(ended.data["reason"], code, "{}", ended.data);
+        let error = events.iter().rev().find(|event| event.event == "error").expect("an error event");
+        assert_eq!(error.data["code"], code, "{}", error.data);
+        // Stop has nothing left to wait for (it used to answer "cancelling" or
+        // leave "Stopping…" up forever).
+        let stop = session.cancel_message("waiting").unwrap();
+        assert_ne!(stop["status"], "cancelling", "{stop}");
+    }
+
+    #[tokio::test]
+    async fn a_session_the_runtime_refuses_to_open_fails_at_once_and_ends_the_waiting_turn() {
+        let starts = tempfile::NamedTempFile::new().unwrap();
+        let starts_path = starts.path().to_string_lossy().into_owned();
+        let (session, manager, _home, _workspace, path) = failing_session(&[
+            ("FAKE_RUNTIME_SWITCH_ERROR", "Flow session metadata is missing or inconsistent."),
+            ("FAKE_RUNTIME_START_LOG", &starts_path),
+        ])
+        .await;
+        wait_until(|| session.status() == Status::Error).await;
+        assert_failed_and_settled(&session, "session-attach-failed");
+        let (events, _) = session.events_after(1);
+        let error = events.iter().rev().find(|event| event.event == "error").unwrap();
+        let message = error.data["message"].as_str().unwrap();
+        assert!(message.contains("Flow session metadata is missing or inconsistent."), "{message}");
+        // The refusal is about the file, not the runtime: no restart may follow.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let started = std::fs::read_to_string(starts.path()).unwrap().lines().count();
+        assert_eq!(started, 1, "a refused session is not retried on new runtimes");
+        assert_eq!(session.status(), Status::Error);
+        // Opening it again is a new attempt with a new session.
+        let again = manager
+            .create(_workspace.path().to_str().unwrap(), Some(path), None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&again, &session));
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_keeps_dying_while_a_message_waits_ends_that_turn() {
+        let (session, manager, _home, _workspace, _path) =
+            failing_session(&[("FAKE_RUNTIME_IGNORE_STDIN", "1"), ("FAKE_RUNTIME_EXIT_ON_START_MS", "5")]).await;
+        for _ in 0..200 {
+            if session.status() == Status::Error {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_failed_and_settled(&session, "runtime-crashed");
+        manager.stop_all();
+    }
+
     #[tokio::test]
     async fn persisted_session_ids_are_stable_and_distinct() {
         let workspace = tempfile::tempdir().unwrap();

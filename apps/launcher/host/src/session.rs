@@ -123,6 +123,7 @@ use sha2::{Digest, Sha256};
 
 pub const DEFAULT_REPLAY_LIMIT: usize = 5_000;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
+const RUNTIME_GAVE_UP: &str = "The runtime could not recover; restart it to continue.";
 
 #[derive(Clone)]
 pub struct RuntimeSpec {
@@ -1686,22 +1687,14 @@ impl Session {
     fn request_messages(&self) {
         let id = self.request_id();
         if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_messages(), &id)) {
-            self.publish(
-                "error",
-                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-            );
-            self.set_status(Status::Error);
+            self.fail(error.code, &error.message, error.retryable);
         }
     }
 
     fn request_state(&self) {
         let id = self.request_id();
         if let Err(error) = self.write_command(pi::command::with_id(pi::command::get_state(), &id)) {
-            self.publish(
-                "error",
-                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-            );
-            self.set_status(Status::Error);
+            self.fail(error.code, &error.message, error.retryable);
         }
     }
 
@@ -1728,11 +1721,7 @@ impl Session {
                 let result =
                     self.write_command(pi::command::with_id(pi::command::switch_session(&path), &id));
                 if let Err(error) = result {
-                    self.publish(
-                        "error",
-                        json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-                    );
-                    self.set_status(Status::Error);
+                    self.fail(error.code, &error.message, error.retryable);
                     return;
                 }
                 *self
@@ -1886,6 +1875,18 @@ impl Session {
                 "runtime.response_failed",
                 json!({ "command": command, "message": message }),
             );
+            // A live runtime that refuses to open the session file (Flow
+            // storage, ownership, a damaged file) answers the same way to any
+            // runtime started after it: restarting cannot help, so the session
+            // fails at once with the runtime's reason.
+            if reply.is_handshake() && matches!(self.status(), Status::Starting | Status::Recovering) {
+                self.fail(
+                    "session-attach-failed",
+                    &format!("This session could not be opened: {message}"),
+                    true,
+                );
+                return;
+            }
             self.publish(
                 "error",
                 json!({ "code": "runtime-error", "message": message, "retryable": false }),
@@ -1910,9 +1911,7 @@ impl Session {
             if reply == pi::Reply::SetThinkingLevel {
                 self.request_state();
             }
-            if reply.is_handshake() && matches!(self.status(), Status::Starting | Status::Recovering) {
-                self.recovery_failed(message.to_string());
-            } else if reply == pi::Reply::Prompt {
+            if reply == pi::Reply::Prompt {
                 self.end_turn(
                     response_id,
                     json!({ "aborted": true, "reason": "runtime-error", "message": message }),
@@ -1928,15 +1927,13 @@ impl Session {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 if cancelled {
-                    self.publish(
-                        "error",
-                        json!({ "code": "session-switch-cancelled", "message": "The runtime cancelled the session switch", "retryable": false }),
+                    // An extension refused the switch: the same refusal awaits
+                    // any restarted runtime.
+                    self.fail(
+                        "session-switch-cancelled",
+                        "The runtime cancelled the session switch",
+                        true,
                     );
-                    if matches!(self.status(), Status::Starting | Status::Recovering) {
-                        self.recovery_failed("session switch cancelled".to_string());
-                    } else {
-                        self.set_status(Status::Error);
-                    }
                     return;
                 }
                 *self
@@ -2536,11 +2533,7 @@ impl Session {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("runtime error");
-                self.publish(
-                    "error",
-                    json!({ "code": "runtime-error", "message": message, "retryable": false }),
-                );
-                self.set_status(Status::Error);
+                self.fail("runtime-error", message, false);
             }
             _ => {}
         }
@@ -3341,10 +3334,7 @@ impl Session {
             self.set_status(Status::Starting);
             self.start(true);
             if matches!(self.status(), Status::Cancelled | Status::Error) {
-                self.publish(
-                    "turn.end",
-                    json!({ "turnId": message_id, "aborted": true, "reason": "runtime-unavailable" }),
-                );
+                self.end_active_turn(json!({ "aborted": true, "reason": "runtime-unavailable" }));
                 messages.remove(client_message_id);
                 return Err(ApiError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -3363,11 +3353,7 @@ impl Session {
             self.set_status(Status::Running);
             let result = self.write_command(prompt);
             if let Err(error) = result {
-                self.publish(
-                    "error",
-                    json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-                );
-                self.set_status(Status::Error);
+                self.fail(error.code, &error.message, error.retryable);
                 messages.remove(client_message_id);
                 return Err(error);
             }
@@ -4162,15 +4148,7 @@ impl Session {
             .write(true)
             .open(&self.lease_path)
         {
-            self.set_status(Status::Error);
-            self.publish(
-                "error",
-                json!({
-                    "code": "internal",
-                    "message": format!("Could not create the runtime lease: {error}"),
-                    "retryable": false,
-                }),
-            );
+            self.fail("internal", &format!("Could not create the runtime lease: {error}"), false);
             return;
         }
         self.spawn_runtime(true, from_pending);
@@ -4303,15 +4281,7 @@ impl Session {
             Decision::GiveUp => 0,
         };
         if count == 0 {
-            self.set_status(Status::Error);
-            self.publish(
-                "error",
-                json!({
-                    "code": "runtime-crashed",
-                    "message": "The runtime could not recover; restart it to continue.",
-                    "retryable": true,
-                }),
-            );
+            self.fail("runtime-crashed", RUNTIME_GAVE_UP, true);
             return;
         }
         log(
@@ -4357,15 +4327,7 @@ impl Session {
             json!({ "reason": reason, "attempts": count }),
         );
         if self.restarts.exhausted() {
-            self.set_status(Status::Error);
-            self.publish(
-                "error",
-                json!({
-                    "code": "runtime-crashed",
-                    "message": "The runtime could not recover; restart it to continue.",
-                    "retryable": true,
-                }),
-            );
+            self.fail("runtime-crashed", RUNTIME_GAVE_UP, true);
             return;
         }
         let session = self.clone();
@@ -4373,6 +4335,96 @@ impl Session {
             tokio::time::sleep(Duration::from_millis(200)).await;
             session.schedule_recovery(reason);
         });
+    }
+
+    /// The session cannot run any more: the one way into `Error`. Nothing may
+    /// be left waiting on a runtime that will not answer, so the turn in
+    /// progress ends as failed, prompts parked for the handshake are dropped,
+    /// open approvals and questions expire, and the runtime is let go (a Stop
+    /// has nothing left to reach). Reopening the session starts a new one.
+    fn fail(&self, code: &str, message: &str, retryable: bool) {
+        if matches!(self.status(), Status::Error | Status::Stopped | Status::Cancelled) {
+            return;
+        }
+        log(
+            &self.home,
+            "warn",
+            "session.failed",
+            json!({ "session": self.id, "code": code, "message": message }),
+        );
+        self.set_status(Status::Error);
+        self.publish(
+            "error",
+            json!({ "code": code, "message": message, "retryable": retryable }),
+        );
+        self.pending_prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.queue_paused.store(true, Ordering::SeqCst);
+        self.steers_in_flight.store(0, Ordering::SeqCst);
+        for item in self
+            .queued_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter_mut()
+        {
+            item.steered = None;
+            item.held = false;
+        }
+        self.end_active_turn(json!({ "status": "failed", "reason": code }));
+        self.cancel_pending(code);
+        self.commands.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        // Events of the released runtime (its exit) must not reach a failed session.
+        self.runtime_generation.fetch_add(1, Ordering::SeqCst);
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(runtime) = runtime {
+            runtime.cancel_pending(code);
+            runtime.terminate();
+        }
+        let _ = std::fs::remove_file(&self.lease_path);
+        self.restarts.settle();
+        self.publish_summary();
+    }
+
+    /// End the turn in progress, whatever stage it reached, without a run
+    /// ending it. A reply cut off mid-stream keeps what arrived.
+    fn end_active_turn(&self, outcome: Value) {
+        let turn = self
+            .active_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(turn) = turn.as_deref() {
+            self.finish_step_reply(turn, None, true);
+            self.close_unfinished_tools();
+        }
+        *self
+            .active_client_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .turn_started_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .active_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.cancelling.store(false, Ordering::SeqCst);
+        self.turn_running.store(false, Ordering::SeqCst);
+        self.prompt_echo.store(false, Ordering::SeqCst);
+        if let Some(turn) = turn {
+            let mut data = json!({ "turnId": turn });
+            if let (Some(data), Some(outcome)) = (data.as_object_mut(), outcome.as_object()) {
+                data.extend(outcome.clone());
+            }
+            self.publish("turn.end", data);
+        }
     }
 
     fn recovery_succeeded(&self) {
@@ -4437,11 +4489,7 @@ impl Session {
                 .active_message
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            self.publish(
-                "error",
-                json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-            );
-            self.set_status(Status::Error);
+            self.fail(error.code, &error.message, error.retryable);
         }
         true
     }
@@ -4459,11 +4507,7 @@ impl Session {
         self.set_status(Status::Running);
         for prompt in prompts {
             if let Err(error) = self.write_command(prompt) {
-                self.publish(
-                    "error",
-                    json!({ "code": error.code, "message": error.message, "retryable": error.retryable }),
-                );
-                self.set_status(Status::Error);
+                self.fail(error.code, &error.message, error.retryable);
                 return;
             }
         }
