@@ -1,4 +1,4 @@
-<!-- Target branch: develop. Pull requests into main are closed; main holds released code only. -->
+<!-- Please target the develop branch. main holds released code only. -->
 
 ## Issue
 
@@ -6,22 +6,16 @@ Fixes #
 
 ## Root cause
 
-<!-- Why the problem happens, in one or two sentences. -->
+<!-- Why the problem happens. -->
 
 ## Change
 
-<!-- What this pull request changes and why it addresses the root cause. Keep it to this issue. -->
+<!-- What this pull request changes. -->
 
-## Verification
+## Testing
 
-<!-- Commands you ran and their results. Screenshots for visible changes. -->
-
-- [ ] A test fails before this change and passes after it
-- [ ] `npm test` and `npm run build` pass in `apps/launcher`
-
-## Checklist
+<!-- How you verified it: tests added or run, screenshots for visible changes. -->
 
 - [ ] Base branch is `develop`
-- [ ] No changes to `.github/`, dependencies, build or release tooling (or agreed in the issue)
-- [ ] No secrets, personal paths or private data
-- [ ] If produced by an AI agent or other tool, it is named here:
+- [ ] A test covers the change
+- [ ] `npm test` and `npm run build` pass in `apps/launcher`
