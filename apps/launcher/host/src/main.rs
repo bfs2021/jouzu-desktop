@@ -28,17 +28,14 @@ fn arg_values(args: &[String], name: &str) -> Vec<String> {
         .collect()
 }
 
-/// `JOUZU_HOME` when set, else the runtime bootstrap's default
-/// (`<LOCALAPPDATA>\Shisa.ai\Jouzu\data`).
-fn jouzu_home() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("JOUZU_HOME").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(home));
-    }
-    if cfg!(windows) {
-        let local = std::env::var_os("LOCALAPPDATA")?;
-        return Some(PathBuf::from(local).join("Shisa.ai").join("Jouzu").join("data"));
-    }
-    None
+/// The Jouzu home: `JOUZU_HOME` when set, else `data` under the host home, the
+/// location every Desktop release since 1.0 has used. It must stay where it is
+/// and is never copied: a session only continues in the home it was created in
+/// (#112).
+fn jouzu_home(home: &std::path::Path, user: Option<std::ffi::OsString>) -> PathBuf {
+    user.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("data"))
 }
 
 fn usage() {
@@ -95,11 +92,10 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Jouzu's home is the runtime's, not Desktop's: the shell passes it, and on
-    // its own the host resolves it the way the runtime bootstrap does (#90).
+    // The shell passes the Jouzu home; on its own the host resolves it the same way.
     let runtime_home = arg_value(&args, "--runtime-home")
         .map(PathBuf::from)
-        .unwrap_or_else(|| jouzu_home().unwrap_or_else(|| home.join("data")));
+        .unwrap_or_else(|| jouzu_home(&home, std::env::var_os("JOUZU_HOME")));
     // The installation (Node, app, Git) lives under the host home, wherever
     // Jouzu's data is.
     let managed = home.clone();
@@ -244,4 +240,21 @@ async fn main() -> ExitCode {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    /// Existing sessions live here. Moving the default strands them (#112).
+    #[test]
+    fn the_default_jouzu_home_is_data_under_the_host_home() {
+        let home = PathBuf::from("C:/Shisa.ai/JouzuDesktop");
+        assert_eq!(jouzu_home(&home, None), home.join("data"));
+        assert_eq!(jouzu_home(&home, Some("".into())), home.join("data"));
+    }
+
+    #[test]
+    fn a_user_jouzu_home_is_followed() {
+        let home = PathBuf::from("C:/Shisa.ai/JouzuDesktop");
+        assert_eq!(jouzu_home(&home, Some("D:/jouzu".into())), PathBuf::from("D:/jouzu"));
+    }
+}

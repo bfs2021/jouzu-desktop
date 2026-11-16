@@ -88,19 +88,22 @@ Desktop folder.
 
 ## Where data lives
 
-Desktop keeps two things apart: Jouzu's data, which it does not own, and its own installation.
+Everything is in one Desktop folder. Jouzu's own data is the `data` folder inside it.
 
 | | Windows | macOS and Linux (development only) |
 | --- | --- | --- |
-| **Jouzu home**: sessions, settings, sign-ins and API keys, tools settings | `JOUZU_HOME` if set, otherwise `%LOCALAPPDATA%\Shisa.ai\Jouzu\data` | `JOUZU_HOME` if set, otherwise `data/` in the Desktop folder |
 | **Desktop folder**: the installed runtime (Node.js and the `jouzu` npm package) and its updates, recent folders, update channel, web access settings and paired devices, logs | `%LOCALAPPDATA%\Shisa.ai\JouzuDesktop` | `~/Library/Application Support/Shisa.ai/JouzuDesktop` (macOS), `$XDG_DATA_HOME/Shisa.ai/JouzuDesktop` (Linux, default `~/.local/share/...`) |
+| **Jouzu home**: sessions, settings, sign-ins and API keys, tools settings | `JOUZU_HOME` if set, otherwise `data\` in the Desktop folder | `JOUZU_HOME` if set, otherwise `data/` in the Desktop folder |
 
-- The Jouzu home on Windows is the same folder the runtime's own start-up uses, so Desktop and
-  `jz` in a terminal share one set of sessions and settings. Desktop runs the runtime with that
-  home; it never copies, rewrites or migrates it, and a different `JOUZU_HOME` is followed as is.
-- Uninstalling Desktop never deletes the Jouzu home, even when you choose to delete app data.
-- A `data` folder that an earlier Desktop version left inside the Desktop folder is no longer
-  used; Desktop does not read, copy or move it.
+- The Jouzu home is where every Desktop release since 1.0 has kept it, and the `jz` and `jouzu`
+  commands that Desktop installs use the same one, so they show the same sessions. A different
+  `JOUZU_HOME` is followed as is.
+- The Jouzu home does not move between releases, and Desktop never copies data into it or out
+  of it. A session continues only in the home it was created in, so a copied session opens but
+  cannot go on.
+- Desktop does not read the home of the earlier Jouzu Launcher (`%LOCALAPPDATA%\Shisa.ai\Jouzu`)
+  or of a `jouzu` you installed yourself with npm. Their sessions stay where they are.
+- Uninstalling keeps the Jouzu home unless you choose to delete app data.
 - `logs/` in the Desktop folder holds the app and host logs (`host.log` records timing for every
   session step) and any crash records. **Settings → System → Open the log folder** opens it.
 
@@ -133,8 +136,7 @@ npm run dev:isolated   # run the app with its own data folder, never your real o
 
 `dev:isolated` keeps everything, including the Jouzu home, under a separate `JouzuDesktopDev`
 folder (override with `JOUZU_LAUNCHER_DEV_HOME`), so a development run cannot touch an
-installed app or your real Jouzu sessions. Any other run without `JOUZU_HOME` uses the real
-Jouzu home.
+installed app or your real Jouzu sessions.
 
 ### Tests
 

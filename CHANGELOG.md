@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.3-rc.2 - unreleased
+
+- Sessions from earlier Desktop versions are back. 1.1.3-rc.1 looked for Jouzu's data in a
+  different folder, so everything created before it was missing from the list. Desktop uses
+  the folder it has always used again (`data` in the Desktop folder, or `JOUZU_HOME` when
+  set), does not move it between releases and never copies data into or out of it (#112).
+
 ## 1.1.3-rc.1 - 2026-11-15
 
 First release candidate for 1.1.3, on the QA channel.
