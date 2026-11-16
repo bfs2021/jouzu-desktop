@@ -223,7 +223,7 @@ async fn main() -> ExitCode {
         })
         .await;
 
-    sessions.stop_all();
+    sessions.shutdown();
     remove_host_file(&home, &token);
     log(
         &home,

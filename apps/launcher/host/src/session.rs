@@ -1990,6 +1990,8 @@ impl Session {
         // Start the next warm runtime only now: on a busy machine a second
         // runtime booting beside this one would slow down the one the user waits for.
         if let Some(pool) = self.config.warm.get() {
+            // This runtime answered, so its start-up work is done (#94).
+            pool.converged();
             let pool = pool.clone();
             let workspace = PathBuf::from(self.runtime_cwd());
             tokio::spawn(async move { pool.aim(&workspace) });
@@ -3886,6 +3888,52 @@ impl Session {
         let _ = std::fs::remove_file(&self.lease_path);
     }
 
+    /// The host is done with this session for good: it was reaped, or the host
+    /// is shutting down. A new conversation nobody ever wrote in also leaves no
+    /// file behind (#92): the host wrote its header at creation, so the host
+    /// removes it, unless the file holds a conversation after all.
+    pub fn discard(&self) {
+        let unused = self.untouched();
+        self.stop();
+        if !unused {
+            return;
+        }
+        let Some(path) = self
+            .session_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        if !session_file_unused(&path) {
+            return;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            log(&self.home, "info", "session.discarded", json!({ "session": self.id }));
+            return;
+        }
+        // The runtime was just terminated; on Windows its handle can outlive
+        // the call for a moment.
+        let home = self.home.clone();
+        let id = self.id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    if !session_file_unused(&path) {
+                        return;
+                    }
+                    if std::fs::remove_file(&path).is_ok() {
+                        log(&home, "info", "session.discarded", json!({ "session": id }));
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
     pub fn info(&self) -> Value {
         json!({
             "sessionId": self.id,
@@ -4198,6 +4246,11 @@ impl Session {
     }
 
     fn spawn_runtime(self: &Arc<Self>, initial: bool, from_pending: bool) -> bool {
+        // Stopped before its start ran (the start is spawned): a runtime started
+        // now would belong to nobody and live until the host exits (#93).
+        if matches!(self.status(), Status::Stopped | Status::Cancelled) {
+            return false;
+        }
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
         // A warm runtime is switched to this session's file by the handshake, so
         // only a session with a file can take one.
@@ -4230,18 +4283,50 @@ impl Session {
                 return true;
             }
             pool.reset_failures();
+        }
+        let mut booting = None;
+        if let Some(pool) = self.config.warm.get() {
+            // Nothing to take, but the pool is spawning one or another session's
+            // runtime is booting, and none has answered yet: this runtime may
+            // have to apply its profile, which fails at once when another
+            // runtime holds the lock (#94). Wait for that one, then try again.
+            if pool.must_wait() {
+                log(
+                    &self.home,
+                    "info",
+                    "runtime.start_deferred",
+                    json!({ "session": self.id, "warm": pool.status() }),
+                );
+                let session = self.clone();
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    pool.wait_turn(Duration::from_secs(300)).await;
+                    if matches!(session.status(), Status::Starting | Status::Recovering) {
+                        session.spawn_runtime(initial, from_pending);
+                    }
+                });
+                return true;
+            }
             log(
                 &self.home,
                 "info",
                 "runtime.cold_start",
-                json!({ "session": self.id, "warm": before }),
+                json!({ "session": self.id, "warm": pool.status() }),
             );
+            // The pool starts nothing beside this runtime until it has attached.
+            booting = Some(pool.booting());
         }
         match self
             .spawn_spec()
             .and_then(|spec| RuntimeSupervisor::start(spec, event_tx))
         {
             Ok(runtime) => {
+                if let Some(booting) = booting {
+                    *self
+                        .warm_attach
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((booting, Instant::now()));
+                }
                 self.install_runtime(runtime, event_rx);
                 true
             }
@@ -4278,7 +4363,19 @@ impl Session {
         *self
             .runtime
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime.clone());
+        // `stop` sets the status before it reads the runtime; this reads the
+        // status after setting it. A stop in between is seen by one of the two,
+        // so the runtime never outlives its session (#93).
+        if matches!(self.status(), Status::Stopped | Status::Cancelled) {
+            runtime.terminate();
+            // Its hold on the pool goes with it.
+            self.warm_attach
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            return;
+        }
         self.restarts.settle();
         let session = self.clone();
         tokio::spawn(async move {
@@ -4604,6 +4701,23 @@ impl Session {
             }
         }
     }
+}
+
+/// A session file with nothing said in it: a header and setup entries (model,
+/// thinking level, extension state), no message of any kind.
+fn session_file_unused(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().filter(|line| !line.trim().is_empty()).all(|line| {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        !matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("message" | "custom_message" | "compaction" | "branch_summary" | "session_info")
+        )
+    })
 }
 
 fn same_session_file(left: &str, right: &str) -> bool {
@@ -5330,7 +5444,7 @@ impl SessionManager {
             .collect();
         for id in stale {
             if let Some(session) = sessions.remove(&id) {
-                session.stop();
+                session.discard();
             }
         }
     }
@@ -5735,6 +5849,9 @@ impl SessionManager {
                 ) {
                     return Ok(existing);
                 }
+                // A session in error can still own a live runtime; one that
+                // leaves the table without a stop keeps it until the host exits.
+                existing.stop();
                 sessions.remove(&existing.id);
             }
         }
@@ -5905,6 +6022,24 @@ impl SessionManager {
             .collect();
         for session in sessions {
             session.stop();
+        }
+    }
+
+    /// The host is exiting: stop everything, and leave no file for a new
+    /// conversation nobody wrote in (#92).
+    pub fn shutdown(&self) {
+        if let Some(pool) = self.warm_runtime() {
+            pool.stop();
+        }
+        let sessions: Vec<Arc<Session>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, session)| session)
+            .collect();
+        for session in sessions {
+            session.discard();
         }
     }
 }
