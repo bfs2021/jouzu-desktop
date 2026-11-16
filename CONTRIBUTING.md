@@ -1,7 +1,8 @@
 # Contributing to Jouzu Desktop
 
 Thanks for your interest in improving Jouzu Desktop. Bug reports, fixes and improvements are
-welcome.
+welcome. Everyone taking part is expected to follow our
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Reporting a problem
 
