@@ -263,6 +263,60 @@ async function webAccessScenario() {
   }
 }
 
+/**
+ * A long saved conversation reads back to its first turn, and a branch from an
+ * early turn holds that turn only (#20). The data folder must already hold a
+ * saved session of PLAYBOOK_LONG_TURNS turns (default 130) whose prompts read
+ * "Long session question N" and replies "Long session answer N", each turn with
+ * a tool call: more than the first page the app loads.
+ * e2e-runtime/long-session.mjs writes it.
+ */
+async function longSessionScenario() {
+  const turns = Number(process.env.PLAYBOOK_LONG_TURNS ?? 130);
+  const name = "A long session reads back to its first message and branches from an early turn (#20)";
+  await page.getByText(/^Long session question 1$/).first().click({ timeout: 30_000 });
+  await waitForConversationText(`Long session answer ${turns}`, 60_000);
+  const start = now();
+  // Earlier messages are either already loaded (Show N earlier) or read from the host
+  // (Load earlier messages); either way the user keeps asking until neither is offered.
+  const earlier = () => conversation().getByRole("button", { name: /^(Show \d+ earlier messages?|Load earlier messages)$/ }).first();
+  let clicks = 0;
+  while (await earlier().isVisible().catch(() => false)) {
+    await earlier().click();
+    clicks += 1;
+    await conversation().getByRole("button", { name: /Loading earlier messages/ }).waitFor({ state: "detached", timeout: 30_000 }).catch(() => {});
+    if (clicks > turns * 3) break;
+  }
+  await mark("longSessionToFirstMessage", now() - start);
+  // textContent, not innerText: messages far off screen skip rendering (content-visibility)
+  // and innerText leaves them out, though the user reaches them by scrolling.
+  const text = await conversation().textContent();
+  const missing = [];
+  let order = -1, ordered = true;
+  for (let turn = 1; turn <= turns; turn += 1) {
+    const question = text.search(new RegExp(`Long session question ${turn}(?!\\d)`));
+    const answer = text.search(new RegExp(`Long session answer ${turn}(?!\\d)`));
+    if (question < 0 || answer < 0) missing.push(turn);
+    else { ordered &&= order < question && question < answer; order = answer; }
+  }
+  if (missing.length || !ordered) {
+    scenario(name, false, `${clicks} clicks; turns missing: ${missing.slice(0, 10).join(", ")}${missing.length > 10 ? "…" : ""}; in order: ${ordered}`);
+    return;
+  }
+  // Branch from the first turn: its footer is the first one in the conversation.
+  await conversation().getByRole("button", { name: "Branch into a new conversation" }).first().click();
+  // The branch opens as its own conversation: turn 1 there, the long session's last turn gone.
+  await page.waitForFunction(last => {
+    const text = document.querySelector('[aria-label="Conversation"]')?.textContent ?? "";
+    return /Long session question 1(?!\d)/.test(text) && !text.includes(`Long session answer ${last}`);
+  }, turns, { timeout: 30_000 }).catch(() => {});
+  const branched = await conversation().textContent();
+  const has = pattern => new RegExp(`${pattern}(?!\\d)`).test(branched);
+  const ok = has("Long session question 1") && has("Long session answer 1")
+    && !has("Long session question 2") && !has("Long session answer 2");
+  scenario(name, ok, ok ? `${turns} turns reached in ${clicks} clicks; branch holds turn 1 only` : `branch shows: ${branched.slice(0, 300)}`);
+}
+
 async function openSettingsTab(name) {
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await settingsDialog().getByRole("tab", { name }).click();
@@ -348,6 +402,12 @@ try {
   // stable release exam runs it on a home of its own (#86).
   if (process.env.PLAYBOOK_SCENARIO === "shisa-key") {
     await shisaKeyWithoutRestart();
+    throw Object.assign(new Error("done"), { done: true });
+  }
+  // PLAYBOOK_SCENARIO=long-session runs only the long session scenario, on a home
+  // that holds the long saved session (#20).
+  if (process.env.PLAYBOOK_SCENARIO === "long-session") {
+    await longSessionScenario();
     throw Object.assign(new Error("done"), { done: true });
   }
 

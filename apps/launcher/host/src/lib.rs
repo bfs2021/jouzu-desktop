@@ -575,25 +575,27 @@ struct MessagesQuery {
     #[serde(rename = "sessionPath")]
     session_path: String,
     limit: Option<usize>,
+    /// Read the messages before this position (the `nextBefore` of the later page).
+    before: Option<usize>,
 }
 
 async fn history_preview(
     State(state): State<AppState>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({
-        "messages": state
+    Ok(Json(
+        state
             .sessions
-            .messages(&query.session_path, query.limit)?,
-    })))
+            .messages(&query.session_path, query.limit, query.before)?,
+    ))
 }
 
 #[derive(Deserialize)]
 struct BranchRequest {
     #[serde(rename = "sessionPath")]
     session_path: String,
-    #[serde(rename = "messageIndex")]
-    message_index: usize,
+    /// The user turn to branch through (1 = the first user message).
+    turn: usize,
 }
 
 async fn branch_session(
@@ -603,7 +605,7 @@ async fn branch_session(
     Ok(Json(json!({
         "sessionPath": state
             .sessions
-            .branch_session(&request.session_path, request.message_index)?,
+            .branch_session(&request.session_path, request.turn)?,
     })))
 }
 
@@ -4913,6 +4915,130 @@ mod session_tests {
         assert_eq!(result["interrupted"], true);
         assert_eq!(result["ok"], false);
         assert_eq!(reply["stopReason"], "toolUse");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_long_saved_session_pages_back_to_its_first_turn_and_branches_by_turn() {
+        // #20: a long conversation (130 turns, each with a tool call) is read page
+        // by page, newest first, until the first turn, with no gap or repeat. Each
+        // row names its user turn, and branching through a turn copies that turn
+        // whole (tool result and final reply included) and nothing after it.
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("long.jsonl");
+        let turns = 130usize;
+        let mut lines = vec![json!({ "type": "session", "version": 3, "id": "long", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() })];
+        for turn in 1..=turns {
+            let call = format!("call-{turn}");
+            lines.push(json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": format!("question {turn}") }] } }));
+            lines.push(json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "toolCall", "id": call, "name": "ls", "arguments": {} }], "stopReason": "toolUse" } }));
+            lines.push(json!({ "type": "message", "message": { "role": "toolResult", "toolCallId": call, "toolName": "ls", "content": [{ "type": "text", "text": "a.txt" }], "isError": false } }));
+            lines.push(json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "text", "text": format!("answer {turn}") }], "stopReason": "stop" } }));
+        }
+        std::fs::write(&file, lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+
+        let mut rows: Vec<Value> = Vec::new();
+        let mut before = None;
+        let mut pages = 0;
+        loop {
+            let page = session.history(200, before);
+            pages += 1;
+            let messages = page["messages"].as_array().unwrap();
+            // Pages arrive newest first; the transcript reads oldest first.
+            rows.splice(0..0, messages.iter().rev().cloned());
+            match page["nextBefore"].as_u64() {
+                Some(next) => before = Some(next),
+                None => break,
+            }
+            assert!(pages < 10, "paging did not end");
+        }
+        assert_eq!(rows.len(), turns * 3, "every saved row is reachable");
+        let cursors: Vec<u64> = rows.iter().map(|row| row["cursor"].as_u64().unwrap()).collect();
+        assert_eq!(cursors, (1..=(turns as u64 * 3)).collect::<Vec<_>>(), "no gap or repeat at page boundaries");
+        for (at, row) in rows.iter().enumerate() {
+            assert_eq!(row["turn"].as_u64(), Some((at / 3 + 1) as u64), "{row}");
+        }
+        assert_eq!(rows[0]["text"], "question 1");
+        assert_eq!(rows.last().unwrap()["text"], format!("answer {turns}"));
+
+        let branch = manager.branch_session(file.to_str().unwrap(), 1).unwrap();
+        let copied: Vec<Value> = std::fs::read_to_string(&branch)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let roles: Vec<&str> = copied.iter().filter_map(|entry| entry["message"]["role"].as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "toolResult", "assistant"]);
+        assert_eq!(copied[3]["message"]["content"][0]["text"], "answer 1");
+        let last = manager.branch_session(file.to_str().unwrap(), turns).unwrap();
+        assert_eq!(std::fs::read_to_string(&last).unwrap().lines().count(), lines.len());
+        assert!(manager.branch_session(file.to_str().unwrap(), 0).is_err());
+        assert!(manager.branch_session(file.to_str().unwrap(), turns + 1).is_err());
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_saved_session_preview_pages_back_with_turn_numbers() {
+        // #20: an idle saved session is shown from its file. Its pages go back to
+        // the first message with no gap or repeat, and each page says which user
+        // turn it starts in.
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("preview-long.jsonl");
+        let mut lines = vec![json!({ "type": "session", "version": 3, "id": "p", "cwd": workspace.path().to_string_lossy() }).to_string()];
+        for turn in 1..=130 {
+            lines.push(json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": format!("q{turn}") }] } }).to_string());
+            lines.push(json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "toolCall", "id": format!("c{turn}"), "name": "ls", "arguments": {} }] } }).to_string());
+            lines.push(json!({ "type": "message", "message": { "role": "toolResult", "toolCallId": format!("c{turn}"), "content": [{ "type": "text", "text": "x" }] } }).to_string());
+            lines.push(json!({ "type": "message", "message": { "role": "assistant", "content": [{ "type": "text", "text": format!("a{turn}") }] } }).to_string());
+        }
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let mut all: Vec<Value> = Vec::new();
+        let mut before = None;
+        let mut turns = Vec::new();
+        loop {
+            let page = manager.messages(&path, Some(200), before).unwrap();
+            let messages = page["messages"].as_array().unwrap().clone();
+            turns.push(page["turn"].as_u64().unwrap());
+            all.splice(0..0, messages);
+            match page["nextBefore"].as_u64() {
+                Some(next) => before = Some(next as usize),
+                None => break,
+            }
+        }
+        assert_eq!(all.len(), 520);
+        assert_eq!(turns, vec![80, 30, 0], "the newest page starts in turn 81, the next in turn 31");
+        assert_eq!(all[0]["content"][0]["text"], "q1");
+        assert_eq!(all[519]["content"][0]["text"], "a130");
+        manager.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_saved_session_larger_than_32_mib_shows_its_newest_messages() {
+        // #20: the newest messages of a long session are at the end of its file.
+        let (manager, _home, workspace) = manager(50);
+        let directory = manager.runtime_home().join("state").join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("big.jsonl");
+        let big = "x".repeat(33 * 1024 * 1024);
+        let lines = [
+            json!({ "type": "session", "version": 3, "id": "big", "cwd": workspace.path().to_string_lossy() }).to_string(),
+            json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": big }] } }).to_string(),
+            json!({ "type": "message", "message": { "role": "user", "content": [{ "type": "text", "text": "newest" }] } }).to_string(),
+        ];
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        let page = manager.messages(&file.to_string_lossy(), Some(1), None).unwrap();
+        assert_eq!(page["messages"][0]["content"][0]["text"], "newest");
+        assert_eq!(page["turn"], 1);
+        assert_eq!(page["nextBefore"], 1);
         manager.stop_all();
     }
 

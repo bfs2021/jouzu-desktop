@@ -32,12 +32,97 @@ function fakeSession(): SessionPort & { emit: (event: ApiEvent) => void; sent: u
 
 const event = (id: number, name: string, data: Record<string, unknown>): ApiEvent => ({ id, event: name, data: { ...data, sessionId: "s-test" } });
 
+/**
+ * A host holding a long conversation: `turns` turns of user, tool call and
+ * reply rows, paged newest first by cursor the way the host does (#20).
+ */
+function longSession(turns: number) {
+  const rows = Array.from({ length: turns }, (_, at) => {
+    const turn = at + 1;
+    return [
+      { kind: "user", id: `u${turn}`, text: `question ${turn}`, blocks: [{ type: "text", text: `question ${turn}` }], turn },
+      { kind: "assistant", id: `c${turn}`, text: "", blocks: [{ type: "toolCall", id: `call-${turn}`, name: "ls", arguments: {} }, { type: "toolResult", toolCallId: `call-${turn}`, ok: true, result: { content: [{ type: "text", text: "a.txt" }] } }], turn },
+      { kind: "assistant", id: `a${turn}`, text: `answer ${turn}`, blocks: [{ type: "text", text: `answer ${turn}` }], turn },
+    ];
+  }).flat().map((row, at) => ({ ...row, cursor: at + 1 }));
+  const requests: { limit?: number; before?: number }[] = [];
+  const session = {
+    ...fakeSession(),
+    rows,
+    requests,
+    history: async (page: { limit?: number; before?: number } = {}): Promise<HistoryPage> => {
+      requests.push(page);
+      const limit = page.limit ?? 200;
+      const older = rows.filter(row => page.before === undefined || row.cursor < page.before).reverse();
+      const messages = older.slice(0, limit);
+      return { messages, nextBefore: messages.length === limit ? messages[messages.length - 1].cursor : null } as unknown as HistoryPage;
+    },
+  };
+  return session;
+}
+
+const texts = (store: SessionStore) => store.snapshot.projection.messages.map(message => message.content.find(block => block.type === "text")?.text ?? "");
+
 describe("SessionStore", () => {
   it("loads host history and projects normalized blocks", async () => {
     const store = SessionStore.attach(fakeSession());
     await store.loadHistory();
     expect(store.snapshot.connected).toBe(true);
     expect(store.snapshot.projection.messages[0].content[0]).toEqual({ type: "text", text: "hello" });
+  });
+
+  it("opens a long session on its newest page and reads back to its first message (#20)", async () => {
+    const session = longSession(130);
+    const store = SessionStore.attach(session);
+    await store.loadHistory();
+    expect(store.snapshot.hasEarlier).toBe(true);
+    expect(store.snapshot.projection.messages).toHaveLength(200);
+    expect(texts(store).at(-1)).toBe("answer 130");
+    let pages = 0;
+    while (store.snapshot.hasEarlier && pages < 10) { await store.loadEarlier(); pages += 1; }
+    expect(store.snapshot.hasEarlier).toBe(false);
+    const messages = store.snapshot.projection.messages;
+    // Every row once, in order, across both page boundaries.
+    expect(messages).toHaveLength(390);
+    expect(messages.map(message => message.turn)).toEqual(session.rows.map(row => row.turn));
+    expect(texts(store)[0]).toBe("question 1");
+    expect(store.snapshot.projection.tools["call-1"]).toMatchObject({ phase: "complete" });
+    expect(store.snapshot.projection.firstIndex).toBe(-190);
+    expect(session.requests.map(request => request.before)).toEqual([undefined, 191]);
+  });
+
+  it("keeps the image references of messages on an earlier page", async () => {
+    const session = longSession(130);
+    Object.assign(session.rows[0], { attachments: [{ id: "img-1", mimeType: "image/png" }] });
+    const store = SessionStore.attach(session);
+    await store.loadHistory();
+    await store.loadEarlier();
+    const first = store.snapshot.projection.messages[0];
+    expect(first.content.find(block => block.type === "image")?.attachment).toEqual({ sessionId: "s-test", id: "img-1" });
+  });
+
+  it("keeps the earlier pages it loaded when the host replaces the history", async () => {
+    const session = longSession(130);
+    const store = SessionStore.attach(session);
+    await store.loadHistory();
+    await store.loadEarlier();
+    expect(store.snapshot.projection.messages).toHaveLength(390);
+    session.emit(event(1, "session.history", { rows: 390 }));
+    await vi.waitFor(() => expect(session.requests.length).toBeGreaterThanOrEqual(4));
+    await vi.waitFor(() => expect(store.snapshot.projection.messages).toHaveLength(390));
+    expect(texts(store)[0]).toBe("question 1");
+  });
+
+  it("drops an earlier page that a full reload overtook", async () => {
+    const session = longSession(130);
+    const store = SessionStore.attach(session);
+    await store.loadHistory();
+    const earlier = store.loadEarlier();
+    const reload = store.refreshHistory();
+    await Promise.all([earlier, reload]);
+    expect(store.snapshot.projection.messages).toHaveLength(200);
+    expect(store.snapshot.loadingEarlier).toBe(false);
+    expect(store.snapshot.hasEarlier).toBe(true);
   });
 
   it("follows message and tool events without raw runtime records", () => {
