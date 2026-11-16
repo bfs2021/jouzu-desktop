@@ -324,6 +324,10 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{id}/queue",
             axum::routing::post(queue_session),
         )
+        .route(
+            "/sessions/{id}/attachments/{attachment}",
+            get(session_attachment),
+        )
         .route("/sessions/{id}/stop", axum::routing::post(stop_session))
         .route("/sessions/{id}/view", axum::routing::post(view_session))
         .route("/sessions/{id}/stats", get(session_stats))
@@ -1703,6 +1707,18 @@ async fn history(
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     Ok(Json(session.history(query.limit.unwrap_or(200), query.before)))
+}
+
+/// An image of a user message in the session's history, by the id the history
+/// row gives it. History rows carry no image data, so every client (desktop
+/// window or web) shows a message's images through this one route (#119).
+async fn session_attachment(
+    State(state): State<AppState>,
+    AxumPath((id, attachment)): AxumPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
+    let (mime_type, data) = session.attachment(&attachment)?;
+    Ok(Json(json!({ "id": attachment, "mimeType": mime_type, "data": data })))
 }
 
 /// A request the host could not serve leaves a line in host.log with what the
@@ -6049,8 +6065,95 @@ mod session_tests {
         let attachment = &user["attachments"][0];
         assert!(attachment.get("data").is_none());
         assert_eq!(attachment["mimeType"], "image/png");
-        assert!(attachment["path"].as_str().unwrap().ends_with(".png"));
-        assert!(std::path::Path::new(attachment["path"].as_str().unwrap()).is_file());
+        // Where the host keeps the file is not part of history (web clients read it).
+        assert!(attachment.get("path").is_none(), "{attachment}");
+        assert!(!history.to_string().contains("attachments\\att-") && !history.to_string().contains("attachments/att-"), "{history}");
+        let id = attachment["id"].as_str().unwrap();
+        assert_eq!(session.attachment(id).unwrap(), ("image/png".to_string(), "AAEC".to_string()));
+    }
+
+    /// Issue #119: a message's images stay in the transcript a client rebuilds
+    /// from host history, for a live session and for one read from its saved file.
+    #[tokio::test]
+    async fn history_images_are_served_by_id_live_and_from_the_saved_file() {
+        let (manager, _home, workspace) = manager(50);
+        let header = json!({ "type": "session", "version": 3, "id": "saved-images", "timestamp": "2026-01-01T00:00:00Z", "cwd": workspace.path().to_string_lossy() });
+        let with_text = json!({ "type": "message", "id": "m1", "parentId": null, "timestamp": "2026-01-01T00:00:01Z", "message": { "role": "user", "content": [
+            { "type": "text", "text": "what is in this picture?" },
+            { "type": "image", "mimeType": "image/webp", "data": "UklGRg==" },
+        ] } });
+        let reply = json!({ "type": "message", "id": "m2", "parentId": "m1", "timestamp": "2026-01-01T00:00:02Z", "message": { "role": "assistant", "content": [{ "type": "text", "text": "A cat." }] } });
+        let image_only = json!({ "type": "message", "id": "m3", "parentId": "m2", "timestamp": "2026-01-01T00:00:03Z", "message": { "role": "user", "content": [
+            { "type": "image", "mimeType": "image/png", "data": "AAEC" },
+        ] } });
+        let file = workspace.path().join("saved.jsonl");
+        std::fs::write(&file, format!("{header}\n{with_text}\n{reply}\n{image_only}\n")).unwrap();
+        let session = manager
+            .create(workspace.path().to_str().unwrap(), Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+
+        let users = |history: &Value| -> Vec<Value> {
+            let mut rows: Vec<Value> = history["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["kind"] == "user")
+                .cloned()
+                .collect();
+            rows.reverse();
+            rows
+        };
+        let history = session.history(50, None);
+        let saved = users(&history);
+        assert_eq!(saved.len(), 2, "the image-only message is kept: {history}");
+        assert_eq!(saved[0]["text"], "what is in this picture?");
+        assert_eq!(saved[0]["attachments"][0]["mimeType"], "image/webp");
+        assert_eq!(saved[0]["attachments"][0]["bytes"], 4);
+        assert_eq!(saved[1]["text"], "");
+        assert_eq!(saved[1]["attachments"][0]["mimeType"], "image/png");
+        assert!(!history.to_string().contains("UklGRg=="), "history carries no image data: {history}");
+
+        // A message sent now, with an image, next to those from the file.
+        session
+            .send_with_client(
+                "live-image",
+                "and this one?",
+                None,
+                &[Attachment { name: "pixel.gif".into(), mime_type: "image/gif".into(), data: "R0lG".into() }],
+            )
+            .unwrap();
+        wait_status(&session, Status::Idle).await;
+        let live = users(&session.history(50, None));
+        assert_eq!(live.len(), 3, "{live:?}");
+
+        let app = app(manager.clone());
+        let fetch = |id: &str| {
+            let app = app.clone();
+            let path = format!("/v1/sessions/{}/attachments/{}", session.id, id);
+            async move { call(app, request(Method::GET, &path).body(Body::empty()).unwrap()).await }
+        };
+        for (row, mime_type, data) in [
+            (&saved[0], "image/webp", "UklGRg=="),
+            (&saved[1], "image/png", "AAEC"),
+            (&live[2], "image/gif", "R0lG"),
+        ] {
+            let id = row["attachments"][0]["id"].as_str().unwrap();
+            let (status, _, body) = fetch(id).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["mimeType"], mime_type);
+            assert_eq!(body["data"], data);
+        }
+        let (status, _, body) = fetch("att-unknown").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        // The file read again (as on reload): same ids, still served.
+        session.open_saved_history();
+        let again = users(&session.history(50, None));
+        assert_eq!(again[0]["attachments"][0]["id"], saved[0]["attachments"][0]["id"]);
+        let (status, _, _) = fetch(saved[1]["attachments"][0]["id"].as_str().unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

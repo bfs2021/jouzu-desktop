@@ -330,6 +330,12 @@ export class HostClient {
     );
   }
 
+  attachment(sessionId: string, attachmentId: string): Promise<{ mimeType: string; data: string }> {
+    return this.request<{ mimeType: string; data: string }>(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(attachmentId)}`,
+    );
+  }
+
   messages(sessionPath: string, limit?: number): Promise<unknown[]> {
     const query = new URLSearchParams({ sessionPath });
     if (limit) query.set("limit", String(limit));

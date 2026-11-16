@@ -202,6 +202,8 @@ export interface SessionApi {
   recover(sessionPath: string): Promise<string | null>;
   /** Replace images the provider refuses with placeholders; the original is kept. */
   sanitizeImages(sessionPath: string): Promise<{ removed: number; backup: string }>;
+  /** An image of a user message in the session's history, by the id its history row gives it. */
+  attachment?(sessionId: string, attachmentId: string): Promise<{ mimeType: string; data: string }>;
   timing(sessionPath: string): Promise<SessionTiming>;
   flowReports(sessionPath: string): Promise<Array<{ kind: string; text: string }>>;
 }
