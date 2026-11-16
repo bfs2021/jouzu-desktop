@@ -704,17 +704,25 @@ export function ChatWorkspace({ path, revision = 0, newSession = true, locked = 
       setLocalSubmitted(current => current === value ? "" : current);
     }
   }
-  /** Remove the images the provider refuses, keeping the original session file. */
+  /**
+   * Take every image out of this session's history (the host keeps the original
+   * file as a backup), then reload it. Which image a provider refused cannot be
+   * told from its error, and any image left in the history is sent again with the
+   * next message, so all of them go; the text of the conversation stays.
+   */
   async function repairSessionImages() {
     const sessionPath = connection.current?.snapshot.sessionFile ?? snapshot.sessionFile;
     if (!sessionPath) return;
-    setImageRepair(false);
     try {
       const result = await api.sessions.sanitizeImages(sessionPath);
-      if (!result.removed) { tell("No image in this session is below the model's minimum.", "info"); return; }
-      tell(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} the model cannot read. The original file is kept as a backup.`, "info");
+      setImageRepair(false);
+      if (!result.removed) { tell("This conversation has no images in its history, so nothing was removed.", "info"); return; }
+      // The failed reply stays in the transcript; its error no longer applies.
+      setDismissed(current => ({ ...current, reply: lastIndex }));
+      connection.current?.clearError();
+      tell(`Removed ${result.removed} image${result.removed === 1 ? "" : "s"} from this conversation. The original file is kept as a backup.`, "info");
       await reloadSession();
-    } catch (error) { report(error, "Could not remove the image."); }
+    } catch (error) { report(error, "Could not remove the images."); }
   }
   const name = workspaceLabel(path);
   function parkPrevious(previous: ChatConnection | null) {

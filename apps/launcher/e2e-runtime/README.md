@@ -87,3 +87,18 @@ node e2e-runtime/model-list-fresh.mjs
 Needs a model-ready throwaway home. Lists the models, adds a provider and its key through the
 control API, lists again (the provider must be there), removes the key and lists again (it must
 be gone), with no restart (#84). Results are written to `model-list-fresh-result.json`.
+
+## A refused image does not trap the session
+
+```powershell
+$env:JOUZU_E2E_HOST_HOME = '<home of a host started on a throwaway data folder>'
+$env:JOUZU_E2E_WORKSPACE = '<workspace folder, added as a workspace>'
+node e2e-runtime/rejected-image.mjs
+```
+
+Needs the fixture provider (model input `["text","image"]`) and the fixture server, which
+refuses any request carrying a PNG with a side of 10 px or less, with the provider text from
+#17. The model reads a 256×1 PNG with the read tool; the refusal must be shown above the
+composer with "Remove images" and "New session", a second message must fail the same way
+without hanging, and after "Remove images" the next message must get a reply. Results are
+written to `rejected-image-result.json`.
