@@ -4224,20 +4224,16 @@ impl Session {
                 true
             }
             Err(error) => {
-                if initial {
-                    self.set_status(if from_pending {
-                        Status::Cancelled
-                    } else {
-                        Status::Error
-                    });
+                let message = format!("Could not start the runtime: {error}");
+                if initial && !from_pending {
+                    self.fail("runtime-unavailable", &message, true);
+                } else if initial {
+                    // The first send started it; that send answers for its turn.
+                    self.set_status(Status::Cancelled);
                     let _ = std::fs::remove_file(&self.lease_path);
                     self.publish(
                         "error",
-                        json!({
-                            "code": "runtime-unavailable",
-                            "message": format!("Could not start the runtime: {error}"),
-                            "retryable": true,
-                        }),
+                        json!({ "code": "runtime-unavailable", "message": message, "retryable": true }),
                     );
                 } else {
                     self.recovery_failed(format!("Could not restart the runtime: {error}"));
